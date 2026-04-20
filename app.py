@@ -27,19 +27,20 @@ scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis
 # 2. Fonction de connexion ROBUSTE
 def get_sheet_client():
     try:
-        # On récupère les secrets directement au format dictionnaire
-        # C'est ici que Streamlit va chercher ce qu'on a mis dans la boîte "Secrets"
-        service_account_info = st.secrets["gcp_service_account"]
+        # On crée une copie des secrets pour pouvoir la modifier
+        # car on ne peut pas modifier st.secrets directement
+        creds_dict = dict(st.secrets["gcp_service_account"])
         
-        # Sécurité : On nettoie la clé privée au cas où il y aurait des doubles antislashes
-        # C'est souvent CA qui fait planter la connexion Google
-        if "private_key" in service_account_info:
-            cleaned_key = service_account_info["private_key"].replace("\\n", "\n")
-            service_account_info["private_key"] = cleaned_key
+        # On nettoie la clé privée dans notre copie
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
-        creds = Credentials.from_service_account_info(service_account_info, scopes=scope)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
         return gspread.authorize(creds)
     
+    except Exception as e:
+        st.error(f"Erreur de configuration des secrets : {e}")
+        st.stop()
     except Exception as e:
         st.error(f"Erreur de configuration des secrets : {e}")
         st.stop()
