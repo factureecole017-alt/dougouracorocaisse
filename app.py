@@ -17,16 +17,47 @@ SCHOOL_PHONE = "Tél: 75172000"
 MONTHS = ["Septembre", "Octobre", "Novembre", "Décembre", "Janvier", "Février", "Mars", "Avril", "Mai"]
 
 # --- CONNEXION GOOGLE SHEETS (La partie modifiée) ---
+import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
+
+# 1. Définition des accès (Portée)
+scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
+# 2. Fonction de connexion ROBUSTE
 def get_sheet_client():
-    # On récupère le dictionnaire directement
-    service_account_info = st.secrets["gcp_service_account"]
-    
-    # On s'assure que la clé privée traite correctement les retours à la ligne
-    if "private_key" in service_account_info:
-        service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
+    try:
+        # On récupère les secrets directement au format dictionnaire
+        # C'est ici que Streamlit va chercher ce qu'on a mis dans la boîte "Secrets"
+        service_account_info = st.secrets["gcp_service_account"]
         
-    creds = Credentials.from_service_account_info(service_account_info, scopes=scope)
-    return gspread.authorize(creds)
+        # Sécurité : On nettoie la clé privée au cas où il y aurait des doubles antislashes
+        # C'est souvent CA qui fait planter la connexion Google
+        if "private_key" in service_account_info:
+            cleaned_key = service_account_info["private_key"].replace("\\n", "\n")
+            service_account_info["private_key"] = cleaned_key
+
+        creds = Credentials.from_service_account_info(service_account_info, scopes=scope)
+        return gspread.authorize(creds)
+    
+    except Exception as e:
+        st.error(f"Erreur de configuration des secrets : {e}")
+        st.stop()
+
+# 3. Initialisation de la base de données
+def init_db():
+    try:
+        client = get_sheet_client()
+        # Remplace bien par le nom EXACT de ton fichier Google Sheets
+        sheet = client.open("Base_Donnees_Caisse").sheet1
+        return sheet
+    except Exception as e:
+        st.error(f"Impossible d'ouvrir le Google Sheet : {e}")
+        st.info("Vérifie que tu as bien partagé le fichier avec l'adresse email du compte de service.")
+        st.stop()
+
+# Appeler l'initialisation au début de ton code principal
+sheet = init_db()
 def init_db():
     """Vérifie si les titres de colonnes existent, sinon les crée"""
     sheet = get_sheet_client()
