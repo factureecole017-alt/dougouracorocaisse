@@ -378,18 +378,7 @@ def show_month(mois):
             "Solde cumulé": st.column_config.NumberColumn(format="%.2f"),
         },
     )
-    import io
-    if not format_table(df).empty:
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            format_table(df).to_excel(writer, index=False, sheet_name='Transactions')
-        
-        st.download_button(
-            label="📥 Sauvegarder les données en Excel",
-            data=buffer.getvalue(),
-            file_name="sauvegarde_caisse_ecole.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+
     st.divider()
     delete_col, receipt_col = st.columns([1, 1])
 
