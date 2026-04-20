@@ -18,12 +18,15 @@ MONTHS = ["Septembre", "Octobre", "Novembre", "Décembre", "Janvier", "Février"
 
 # --- CONNEXION GOOGLE SHEETS (La partie modifiée) ---
 def get_sheet_client():
-    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scope)
-    client = gspread.authorize(creds)
-    # Vérifie que le nom "Base_Donnees_Caisse" correspond bien à ton fichier Sheets
-    return client.open("Base_Donnees_Caisse").sheet1
-
+    # On récupère le dictionnaire directement
+    service_account_info = st.secrets["gcp_service_account"]
+    
+    # On s'assure que la clé privée traite correctement les retours à la ligne
+    if "private_key" in service_account_info:
+        service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
+        
+    creds = Credentials.from_service_account_info(service_account_info, scopes=scope)
+    return gspread.authorize(creds)
 def init_db():
     """Vérifie si les titres de colonnes existent, sinon les crée"""
     sheet = get_sheet_client()
