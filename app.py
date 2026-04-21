@@ -60,24 +60,16 @@ def add_mouvement(mois, movement_date, designation, nom, classe, entree, sortie)
         float(sortie or 0)
     ])
 
+# --- SEULE PARTIE MODIFIÉE POUR LA CORRECTION ---
 def delete_mouvement(row_id):
     sheet = get_sheet()
-    # On récupère toutes les valeurs pour être sûr de l'ordre des lignes
     all_values = sheet.get_all_values()
-    
-    # On cherche la ligne qui contient l'ID sélectionné
-    # i commence à 0, donc la ligne 1 du Sheets est all_values[0]
-    for i, row_values in enumerate(all_values):
-        if i == 0: continue # On saute l'en-tête
-        
-        # On vérifie si la première colonne correspond à l'ID
-        try:
-            if int(row_values[0]) == int(row_id):
-                sheet.delete_rows(i + 1) # i+1 car Google Sheets commence à 1
-                return True
-        except (ValueError, IndexError):
-            continue
-    return False
+    # On parcourt les lignes pour trouver celle qui a cet ID en colonne A (index 0)
+    for i, row in enumerate(all_values):
+        if i == 0: continue # On saute l'entête
+        if str(row[0]) == str(row_id):
+            sheet.delete_rows(i + 1) # +1 car Sheets commence à 1
+            break
 
 def load_mouvements(mois=None):
     sheet = get_sheet()
@@ -260,7 +252,6 @@ def main():
     if not check_password(): return
     init_db()
     
-    # MODIFICATION : Affichage du logo à côté du titre
     col_logo, col_title = st.columns([1, 8])
     if LOGO_PATH.exists():
         col_logo.image(str(LOGO_PATH), width=80)
