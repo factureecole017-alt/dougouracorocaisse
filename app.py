@@ -21,29 +21,21 @@ scope = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-# Ta fonction commence juste après
 def get_sheet_client():
     try:
-        # ... (le reste de ton code)
-def get_sheet_client():
-    try:
+        # Ces lignes DOIVENT être décalées vers la droite
         import json
-        # 1. On récupère le texte JSON depuis les secrets
-        # Assure-toi que le nom dans les secrets est bien GCP_JSON
         secret_json = st.secrets["GCP_JSON"]
-        
-        # 2. On transforme le texte en dictionnaire Python
         creds_dict = json.loads(secret_json)
         
-        # 3. On nettoie la clé privée (important pour Google)
         if "private_key" in creds_dict:
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
         
-        # 4. On se connecte
         creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
         return gspread.authorize(creds)
         
     except Exception as e:
+        # Ces lignes aussi doivent être décalées
         st.error(f"Erreur de connexion Google Drive : {e}")
         st.stop()
 # 3. Initialisation de la base de données
