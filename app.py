@@ -62,11 +62,22 @@ def add_mouvement(mois, movement_date, designation, nom, classe, entree, sortie)
 
 def delete_mouvement(row_id):
     sheet = get_sheet()
-    data = sheet.get_all_records()
-    for i, row in enumerate(data):
-        if int(row.get("id", 0)) == int(row_id):
-            sheet.delete_rows(i + 2)
-            break
+    # On récupère toutes les valeurs pour être sûr de l'ordre des lignes
+    all_values = sheet.get_all_values()
+    
+    # On cherche la ligne qui contient l'ID sélectionné
+    # i commence à 0, donc la ligne 1 du Sheets est all_values[0]
+    for i, row_values in enumerate(all_values):
+        if i == 0: continue # On saute l'en-tête
+        
+        # On vérifie si la première colonne correspond à l'ID
+        try:
+            if int(row_values[0]) == int(row_id):
+                sheet.delete_rows(i + 1) # i+1 car Google Sheets commence à 1
+                return True
+        except (ValueError, IndexError):
+            continue
+    return False
 
 def load_mouvements(mois=None):
     sheet = get_sheet()
