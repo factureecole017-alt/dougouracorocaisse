@@ -86,10 +86,18 @@ def delete_mouvement(row_id):
             sheet.delete_rows(index + 2)
             break
 
-def load_mouvements(mois=None):
-    sheet = get_sheet_client()
-    records = sheet.get_all_records()
-    df = pd.DataFrame(records)
+def load_mouvements():
+    try:
+        sheet = init_db()
+        records = sheet.get_all_records()
+        if not records:
+            # Si c'est vide, on retourne un tableau vide au lieu de planter
+            return pd.DataFrame(columns=["Date", "Mois", "Type", "Libellé", "Montant"])
+        return pd.DataFrame(records)
+    except Exception as e:
+        # On affiche une erreur plus claire
+        st.warning("Aucune donnée trouvée ou format incorrect. Vérifiez les titres de colonnes.")
+        return pd.DataFrame(columns=["Date", "Mois", "Type", "Libellé", "Montant"])
     
     if df.empty:
         return df
