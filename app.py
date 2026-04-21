@@ -234,19 +234,23 @@ def check_password():
 # 1. On charge d'abord les données
 all_df = load_mouvements()
 
-# 2. On vérifie SI elles ne sont pas vides AVANT de les utiliser
 if all_df is not None and not all_df.empty:
-    # Ici, ton code pour afficher les résumés ou les graphiques
-    show_global_summary(all_df)
-else:
-    st.info("La base de données est actuellement vide. Ajoutez une opération pour commencer.")
-    if not df.empty:
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Entrées", money(df["entree"].sum()))
-        col2.metric("Sorties", money(df["sortie"].sum()))
-        col3.metric("Solde", money(df["entree"].sum() - df["sortie"].sum()))
-        st.dataframe(format_table(df), hide_index=True)
-        
+        show_global_summary(all_df)
+    else:
+        st.info("La base de données est actuellement vide.")
+        # On crée un all_df vide pour que la suite du code ne plante pas
+        all_df = pd.DataFrame(columns=["Date", "Mois", "Type", "Libellé", "Montant"])
+
+    st.divider()
+    
+    # Dans la partie suppression, on utilise aussi all_df
+    st.subheader("Supprimer / Reçus")
+    if not all_df.empty:
+        options = {f"ID {r.Index} | {r.Libellé}": r.Index for r in all_df.itertuples()}
+        sel = st.selectbox("Sélectionner une ligne", list(options.keys()), key=f"sel-global")
+        if st.button("Supprimer", type="primary"):
+            delete_mouvement(options[sel])
+            st.rerun()
         st.divider()
         st.subheader("Supprimer / Reçus")
         options = {f"ID {r.id} | {r.nom}": int(r.id) for r in df.itertuples(index=False)}
