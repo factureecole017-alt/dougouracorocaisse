@@ -231,16 +231,15 @@ def check_password():
 
 # --- INTERFACE (Inchangée) ---
 # Exemple de correction pour le calcul du résumé
-if not all_df.empty:
-    df_mois = all_df[all_df['Mois'] == mois]
-    if not df_mois.empty:
-        total_recettes = df_mois[df_mois['Type'] == 'Recette']['Montant'].astype(float).sum()
-        total_depenses = df_mois[df_mois['Type'] == 'Dépense']['Montant'].astype(float).sum()
-        st.metric("Solde du mois", f"{total_recettes - total_depenses} FCFA")
-    else:
-        st.info(f"Aucune opération enregistrée pour {mois}.")
+# 1. On charge d'abord les données
+all_df = load_mouvements()
+
+# 2. On vérifie SI elles ne sont pas vides AVANT de les utiliser
+if all_df is not None and not all_df.empty:
+    # Ici, ton code pour afficher les résumés ou les graphiques
+    show_global_summary(all_df)
 else:
-    st.info("La base de données est vide.")
+    st.info("La base de données est actuellement vide. Ajoutez une opération pour commencer.")
     if not df.empty:
         col1, col2, col3 = st.columns(3)
         col1.metric("Entrées", money(df["entree"].sum()))
