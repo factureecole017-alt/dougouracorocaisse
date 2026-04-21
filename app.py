@@ -10,7 +10,7 @@ from datetime import date
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
-# --- CONFIGURATION INITIALE ---
+# --- CONFIGURATION ---
 LOGO_PATH = Path("logo.png")
 SCHOOL_NAME = "Complexe Scolaire Dougouracoro Sema"
 SCHOOL_PHONE = "Tél: 75172000"
@@ -27,20 +27,15 @@ def get_sheet_client():
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
         return gspread.authorize(creds)
     except Exception as e:
-        st.error(f"Erreur de connexion Google : {e}")
+        st.error(f"Erreur de connexion : {e}")
         st.stop()
 
 def init_db():
-    try:
-        client = get_sheet_client()
-        # On ouvre par le nom exact du fichier
-        spreadsheet = client.open("Caisse Scolaire")
-        return spreadsheet.get_worksheet(0)
-    except Exception as e:
-        st.error(f"Erreur d'accès au fichier : {e}")
-        st.stop()
+    client = get_sheet_client()
+    spreadsheet = client.open("Caisse Scolaire")
+    return spreadsheet.get_worksheet(0)
 
-# --- GESTION DES DONNÉES ---
+# --- FONCTIONS DE DONNÉES ---
 def load_mouvements():
     try:
         sheet = init_db()
@@ -48,121 +43,122 @@ def load_mouvements():
         if not records:
             return pd.DataFrame(columns=["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"])
         df = pd.DataFrame(records)
-        # Nettoyage des types
         df["entree"] = pd.to_numeric(df["entree"], errors='coerce').fillna(0)
         df["sortie"] = pd.to_numeric(df["sortie"], errors='coerce').fillna(0)
         return df
     except Exception as e:
         st.error(f"Erreur de chargement : {e}")
-        return pd.DataFrame(columns=["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"])
+        return pd.DataFrame()
 
 def add_mouvement(mois, movement_date, designation, nom, classe, entree, sortie):
-    try:
-        sheet = init_db()
-        new_id = len(sheet.get_all_values())
-        sheet.append_row([new_id, mois, movement_date.isoformat(), designation.strip(), nom.strip(), classe.strip(), float(entree or 0), float(sortie or 0)])
-        st.success("Opération enregistrée !")
-    except Exception as e:
-        st.error(f"Erreur d'ajout : {e}")
+    sheet = init_db()
+    new_id = len(sheet.get_all_values())
+    sheet.append_row([new_id, mois, movement_date.isoformat(), designation, nom, classe, float(entree), float(sortie)])
 
 def delete_mouvement(row_id):
-    try:
-        sheet = init_db()
-        data = sheet.get_all_records()
-        for index, row in enumerate(data):
-            if int(row['id']) == int(row_id):
-                sheet.delete_rows(index + 2)
-                st.success("Ligne supprimée !")
-                break
-    except Exception as e:
-        st.error(f"Erreur de suppression : {e}")
+    sheet = init_db()
+    data = sheet.get_all_records()
+    for index, row in enumerate(data):
+        if int(row['id']) == int(row_id):
+            sheet.delete_rows(index + 2)
+            break
 
-# --- UTILITAIRES & PDF ---
-def money(value):
-    return f"{float(value):,.0f}".replace(",", " ") + " FCFA"
-
+# --- UTILITAIRES PDF ---
 def clean_pdf_text(value):
     return str(value).encode("latin-1", "replace").decode("latin-1")
+
+def money(value):
+    return f"{float(value):,.0f}".replace(",", " ") + " FCFA"
 
 def generate_receipt_pdf(row, mois):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 10, clean_pdf_text(SCHOOL_NAME), ln=True, align='C')
+    pdf.set_font("Helvetica", "", 12)
+    pdf.cell(0, 10, clean_pdf_text(SCHOOL_PHONE), ln=True, align='C')
+    pdf.ln(10)
     pdf.set_font("Helvetica", "B", 14)
     pdf.cell(0, 10, "REÇU DE CAISSE", ln=True, align='C')
-    pdf.ln(10)
-    pdf.set_font("Helvetica", "", 12)
+    pdf.ln(5)
+    
     amount = row.entree if float(row.entree) > 0 else row.sortie
-    pdf.cell(0, 10, f"Date: {row.date}", ln=True)
-    pdf.cell(0, 10, f"Nom: {row.nom}", ln=True)
-    pdf.cell(0, 10, f"Classe: {row.classe}", ln=True)
-    pdf.cell(0, 10, f"Motif: {row.designation}", ln=True)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 10, f"Montant: {money(amount)}", ln=True)
+    fields = [("N° Reçu", row.id), ("Date", row.date), ("Élève", row.nom), ("Classe", row.classe), ("Motif", row.designation), ("Montant", money(amount))]
+    
+    for label, val in fields:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(40, 10, f"{label}: ", 0)
+        pdf.set_font("Helvetica", "", 12)
+        pdf.cell(0, 10, clean_pdf_text(val), 0, ln=True)
+    
+    pdf.ln(20)
+    pdf.cell(0, 10, "Signature de la Direction: ___________________", align='R', ln=True)
     return pdf.output()
 
 # --- INTERFACE ---
-def check_password():
-    if st.session_state.get("authenticated"): return True
-    st.title("Connexion")
-    password = st.text_input("Mot de passe", type="password")
-    if st.button("Se connecter"):
-        if password == st.secrets["MON_MOT_DE_PASSE"]:
-            st.session_state["authenticated"] = True
-            st.rerun()
-        else: st.error("Mot de passe incorrect.")
-    return False
-
 def show_month(mois, all_df):
-    st.header(f"Opérations de {mois}")
+    st.subheader(f"Opérations de {mois}")
     
-    # Formulaire d'ajout
-    with st.expander(f"Ajouter une opération pour {mois}"):
+    with st.expander(f"➕ Ajouter une opération"):
         with st.form(f"form_{mois}"):
-            col1, col2 = st.columns(2)
-            m_date = col1.date_input("Date", date.today())
-            design = col1.text_input("Désignation")
-            nom = col2.text_input("Nom de l'élève")
-            classe = col2.text_input("Classe")
-            entree = col1.number_input("Entrée (Somme reçue)", min_value=0.0)
-            sortie = col2.number_input("Sortie (Dépense)", min_value=0.0)
-            if st.form_submit_button("Enregistrer"):
+            c1, c2 = st.columns(2)
+            m_date = c1.date_input("Date", date.today())
+            nom = c2.text_input("Nom de l'élève")
+            design = c1.text_input("Désignation")
+            classe = c2.text_input("Classe")
+            entree = c1.number_input("Entrée", min_value=0.0, step=500.0)
+            sortie = c2.number_input("Sortie", min_value=0.0, step=500.0)
+            if st.form_submit_button("Valider"):
                 add_mouvement(mois, m_date, design, nom, classe, entree, sortie)
                 st.rerun()
 
-    # Affichage des données
     df_mois = all_df[all_df["mois"] == mois]
     if not df_mois.empty:
-        st.dataframe(df_mois)
+        st.dataframe(df_mois, use_container_width=True)
         
-        # Actions (Suppression / Reçu)
-        st.subheader("Actions")
-        selected_id = st.selectbox("Choisir une opération", df_mois["id"].tolist(), format_func=lambda x: f"ID {x} - {df_mois[df_mois['id']==x]['nom'].values[0]}")
-        col_del, col_rec = st.columns(2)
+        st.divider()
+        st.subheader("🗑️ Suppression & 📄 Reçus")
+        # Sélection par nom d'élève pour plus de clarté
+        options = {f"ID {r.id} | {r.nom}": r.id for r in df_mois.itertuples()}
+        selected_label = st.selectbox("Sélectionner une ligne", list(options.keys()), key=f"sel_{mois}")
+        selected_id = options[selected_label]
         
-        if col_del.button("Supprimer", key=f"del_{mois}", type="primary"):
+        col1, col2 = st.columns(2)
+        if col1.button("Supprimer cette ligne", type="primary", key=f"del_{mois}"):
             delete_mouvement(selected_id)
             st.rerun()
             
-        row = df_mois[df_mois["id"] == selected_id].iloc[0]
-        col_rec.download_button("Télécharger le reçu", data=generate_receipt_pdf(row, mois), file_name=f"Recu_{row.nom}.pdf", mime="application/pdf")
+        row_data = df_mois[df_mois["id"] == selected_id].iloc[0]
+        col2.download_button("Imprimer le Reçu (PDF)", data=generate_receipt_pdf(row_data, mois), file_name=f"Recu_{row_data.nom}.pdf", mime="application/pdf")
     else:
-        st.info("Aucune donnée pour ce mois.")
+        st.info("Aucune donnée enregistrée pour ce mois.")
 
 def main():
-    st.set_page_config(page_title="Caisse scolaire", layout="wide")
-    if not check_password(): return
+    st.set_page_config(page_title="Caisse Dougouracoro", layout="wide")
     
+    # Vérification simple du mot de passe
+    if "auth" not in st.session_state:
+        st.session_state.auth = False
+        
+    if not st.session_state.auth:
+        st.title("Connexion")
+        pwd = st.text_input("Mot de passe", type="password")
+        if st.button("Entrer"):
+            if pwd == st.secrets["MON_MOT_DE_PASSE"]:
+                st.session_state.auth = True
+                st.rerun()
+            else: st.error("Code incorrect")
+        return
+
+    st.title("🏫 Gestion de caisse scolaire")
     all_df = load_mouvements()
     
     # Sidebar
-    st.sidebar.title("Tableau de Bord")
-    total_e = all_df["entree"].sum()
-    total_s = all_df["sortie"].sum()
-    st.sidebar.metric("Solde Total", money(total_e - total_s))
+    st.sidebar.header("Tableau de Bord")
+    solde = all_df["entree"].sum() - all_df["sortie"].sum() if not all_df.empty else 0
+    st.sidebar.metric("Solde Global", money(solde))
     if st.sidebar.button("Déconnexion"):
-        st.session_state["authenticated"] = False
+        st.session_state.auth = False
         st.rerun()
 
     # Onglets
