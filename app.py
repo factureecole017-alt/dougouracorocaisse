@@ -45,9 +45,8 @@ def init_db():
 
 def add_mouvement(mois, movement_date, designation, nom, classe, entree, sortie):
     sheet = get_sheet()
-    # MODIFICATION : On compte les lignes pour avoir un ID numérique (1, 2, 3...)
     all_values = sheet.get_all_values()
-    next_id = len(all_values) # Si 1 ligne d'entête, la nouvelle sera la 2ème (ID=1)
+    next_id = len(all_values)
     
     sheet.append_row([
         next_id,
@@ -60,15 +59,16 @@ def add_mouvement(mois, movement_date, designation, nom, classe, entree, sortie)
         float(sortie or 0)
     ])
 
-# --- SEULE PARTIE MODIFIÉE POUR LA CORRECTION ---
+# --- LA PARTIE CORRIGÉE ---
 def delete_mouvement(row_id):
     sheet = get_sheet()
+    # On récupère toutes les lignes brute pour éviter l'erreur de conversion
     all_values = sheet.get_all_values()
-    # On parcourt les lignes pour trouver celle qui a cet ID en colonne A (index 0)
     for i, row in enumerate(all_values):
-        if i == 0: continue # On saute l'entête
+        if i == 0: continue # Sauter l'entête
+        # On compare en texte pour être sûr de trouver l'ID
         if str(row[0]) == str(row_id):
-            sheet.delete_rows(i + 1) # +1 car Sheets commence à 1
+            sheet.delete_rows(i + 1)
             break
 
 def load_mouvements(mois=None):
@@ -86,7 +86,7 @@ def load_mouvements(mois=None):
     df["solde_cumule"] = df["solde"].cumsum()
     return df
 
-# --- FONCTIONS PDF ---
+# --- FONCTIONS PDF (Inchangées) ---
 def clean_pdf_text(value):
     return str(value).encode("latin-1", "replace").decode("latin-1")
 
