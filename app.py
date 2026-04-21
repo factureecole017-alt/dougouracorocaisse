@@ -53,12 +53,23 @@ def init_db():
 # Appeler l'initialisation au début de ton code principal
 sheet = init_db()
 def init_db():
-    """Vérifie si les titres de colonnes existent, sinon les crée"""
-    sheet = get_sheet_client()
-    headers = ["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"]
-    first_row = sheet.row_values(1)
-    if not first_row:
-        sheet.append_row(headers)
+    try:
+        client = get_sheet_client()
+        # Remplace "Nom_De_Ton_Fichier" par le nom exact de ton fichier Google Sheets
+        spreadsheet = client.open("Caisse Scolaire") 
+        
+        try:
+            # On essaie d'ouvrir l'onglet "Données"
+            sheet = spreadsheet.worksheet("Données")
+        except:
+            # Si l'onglet n'existe pas, on le crée avec les titres
+            sheet = spreadsheet.add_worksheet(title="Données", rows="100", cols="20")
+            sheet.append_row(["Date", "Mois", "Type", "Libellé", "Montant"])
+        
+        return sheet
+    except Exception as e:
+        st.error(f"Erreur lors de l'accès au fichier Sheets : {e}")
+        st.stop()
 
 def add_mouvement(mois, movement_date, designation, nom, classe, entree, sortie):
     sheet = get_sheet_client()
