@@ -17,19 +17,25 @@ SCHOOL_PHONE = "Tél: 75172000"
 MONTHS = ["Septembre", "Octobre", "Novembre", "Décembre", "Janvier", "Février", "Mars", "Avril", "Mai"]
 def get_sheet_client():
     try:
-        # On crée une copie pour pouvoir modifier la clé sans erreur
-        creds_dict = dict(st.secrets["gcp_service_account"])
+        import json
+        # 1. On récupère le texte JSON depuis les secrets
+        # Assure-toi que le nom dans les secrets est bien GCP_JSON
+        secret_json = st.secrets["GCP_JSON"]
         
-        # On nettoie la clé privée
+        # 2. On transforme le texte en dictionnaire Python
+        creds_dict = json.loads(secret_json)
+        
+        # 3. On nettoie la clé privée (important pour Google)
         if "private_key" in creds_dict:
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-
+        
+        # 4. On se connecte
         creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
         return gspread.authorize(creds)
+        
     except Exception as e:
-        st.error(f"Erreur : {e}")
+        st.error(f"Erreur de connexion Google Drive : {e}")
         st.stop()
-
 # 3. Initialisation de la base de données
 def init_db():
     try:
