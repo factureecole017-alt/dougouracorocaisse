@@ -230,30 +230,17 @@ def check_password():
     return False
 
 # --- INTERFACE (Inchangée) ---
-def show_month(mois):
-    st.subheader(mois)
-    df = load_mouvements(mois)
-    st.download_button("Imprimer le résumé", data=generate_monthly_summary_pdf(df, mois) if not df.empty else b"", file_name=f"resume_{mois.lower()}.pdf", mime="application/pdf", disabled=df.empty, key=f"summary-{mois}")
-    
-    with st.form(f"form-{mois}", clear_on_submit=True):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            m_date = st.date_input("Date", value=date.today(), key=f"d-{mois}")
-            nom = st.text_input("Nom", key=f"n-{mois}")
-        with col2:
-            desig = st.text_input("Désignation", key=f"de-{mois}")
-            classe = st.text_input("Classe", key=f"cl-{mois}")
-        with col3:
-            entree = st.number_input("Entrée", min_value=0.0, step=100.0, format="%.2f", key=f"e-{mois}")
-            sortie = st.number_input("Sortie", min_value=0.0, step=100.0, format="%.2f", key=f"s-{mois}")
-        if st.form_submit_button("Ajouter"):
-            if not desig.strip() or not nom.strip() or not classe.strip(): st.error("Champs obligatoires !")
-            elif entree == 0 and sortie == 0: st.error("Saisissez un montant !")
-            else:
-                add_mouvement(mois, m_date, desig, nom, classe, entree, sortie)
-                st.success("Ajouté !")
-                st.rerun()
-
+# Exemple de correction pour le calcul du résumé
+if not all_df.empty:
+    df_mois = all_df[all_df['Mois'] == mois]
+    if not df_mois.empty:
+        total_recettes = df_mois[df_mois['Type'] == 'Recette']['Montant'].astype(float).sum()
+        total_depenses = df_mois[df_mois['Type'] == 'Dépense']['Montant'].astype(float).sum()
+        st.metric("Solde du mois", f"{total_recettes - total_depenses} FCFA")
+    else:
+        st.info(f"Aucune opération enregistrée pour {mois}.")
+else:
+    st.info("La base de données est vide.")
     if not df.empty:
         col1, col2, col3 = st.columns(3)
         col1.metric("Entrées", money(df["entree"].sum()))
