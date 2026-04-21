@@ -15,6 +15,16 @@ LOGO_PATH = Path("logo.png")
 SCHOOL_NAME = "Complexe Scolaire Dougouracoro Sema"
 SCHOOL_PHONE = "Tél: 75172000"
 MONTHS = ["Septembre", "Octobre", "Novembre", "Décembre", "Janvier", "Février", "Mars", "Avril", "Mai"]
+# Ajoute ces lignes ici
+scope = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# Ta fonction commence juste après
+def get_sheet_client():
+    try:
+        # ... (le reste de ton code)
 def get_sheet_client():
     try:
         import json
