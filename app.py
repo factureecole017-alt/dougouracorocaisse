@@ -10,18 +10,18 @@ from fpdf.enums import XPos, YPos
 import unicodedata
 import re
 
-# --- CONFIGURATION ---
+# --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Caisse scolaire", layout="wide")
 
-# Masquer les menus Streamlit pour plus de propreté sur mobile
-st.markdown("""<style>#MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}</style>""", unsafe_allow_html=True)
+# Nettoyage visuel pour mobile (cache les éléments inutiles de Streamlit)
+st.markdown("""<style>#MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;} .stDeployButton {display:none;}</style>""", unsafe_allow_html=True)
 
 LOGO_PATH = Path("logo.png")
 SCHOOL_NAME = "Complexe Scolaire Dougouracoro Sema"
 SCHOOL_PHONE = "Tél: 75172000"
 MONTHS = ["Septembre", "Octobre", "Novembre", "Décembre", "Janvier", "Février", "Mars", "Avril", "Mai"]
 
-# --- CONNEXION SÉCURISÉE ---
+# --- 2. CONNEXION ---
 def get_sheet():
     try:
         creds_dict = json.loads(st.secrets["GCP_JSON"])
@@ -35,55 +35,53 @@ def get_sheet():
         st.error(f"Erreur de connexion : {e}")
         return None
 
-# --- ACTIONS SUR LES DONNÉES ---
+# --- 3. GESTION DES DONNÉES (BLINDÉE) ---
 def load_mouvements(mois_cible=None):
     sheet = get_sheet()
     if not sheet: return pd.DataFrame()
     
-    # On force la lecture par index de colonne pour éviter l'erreur "duplicates"
+    # On force la lecture par position pour éviter l'erreur "duplicates"
     data = sheet.get_all_values()
     if len(data) <= 1:
         return pd.DataFrame(columns=["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"])
     
-    # On définit nos propres colonnes proprement
+    # On ignore les titres du fichier Excel et on impose les nôtres
     df = pd.DataFrame(data[1:], columns=["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"])
     
-    # Nettoyage des chiffres (très important pour les calculs)
+    # Nettoyage forcé pour que les SOMMES fonctionnent enfin
     df["entree"] = pd.to_numeric(df["entree"], errors='coerce').fillna(0)
     df["sortie"] = pd.to_numeric(df["sortie"], errors='coerce').fillna(0)
     
     if mois_cible:
         df = df[df["mois"] == mois_cible]
     
-    # Calculs automatiques
+    # Calcul des soldes
     df["solde"] = df["entree"] - df["sortie"]
-    df["solde_cumule"] = df["solde"].cumsum()
     return df
 
 def add_mouvement(mois, movement_date, designation, nom, classe, entree, sortie):
     sheet = get_sheet()
     if not sheet: return
-    all_rows = sheet.get_all_values()
-    next_id = len(all_rows) # Génère l'ID automatiquement
-    
+    # L'ID est simplement le nombre de lignes + 1
+    next_id = len(sheet.get_all_values())
     sheet.append_row([
         str(next_id), mois, movement_date.isoformat(),
         designation.strip(), nom.strip(), classe.strip(),
-        str(entree), str(sortie)
+        str(float(entree)), str(float(sortie))
     ])
 
 def delete_mouvement(row_id):
     sheet = get_sheet()
     if not sheet: return
-    # On récupère tout en texte brut pour trouver la ligne
     data = sheet.get_all_values()
+    # On cherche l'ID dans la colonne 0
     for i, row in enumerate(data):
-        if i == 0: continue # On saute l'entête
+        if i == 0: continue
         if len(row) > 0 and str(row[0]) == str(row_id):
             sheet.delete_rows(i + 1)
             break
 
-# --- FONCTIONS PDF (Version Rapide) ---
+# --- 4. PDF ---
 def clean_pdf_text(value):
     return str(value).encode("latin-1", "replace").decode("latin-1")
 
@@ -100,15 +98,16 @@ def generate_receipt_pdf(row, mois):
     pdf.ln(10)
     
     pdf.set_font("Helvetica", "", 11)
-    infos = [("ID", row.id), ("Nom", row.nom), ("Classe", row.classe), 
-             ("Désignation", row.designation), ("Montant", f"{row.entree + row.sortie} FCFA")]
-    for k, v in infos:
+    fields = [("N° Reçu", row.id), ("Nom Éléve", row.nom), ("Classe", row.classe), 
+              ("Désignation", row.designation), ("Montant", f"{row.entree + row.sortie} FCFA")]
+    for k, v in fields:
         pdf.cell(40, 10, f"{k}:", border=0)
         pdf.cell(0, 10, clean_pdf_text(v), border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     return pdf.output()
 
-# --- INTERFACE ---
+# --- 5. INTERFACE ---
 def main():
+    # Login
     if "auth" not in st.session_state: st.session_state.auth = False
     if not st.session_state.auth:
         pwd = st.text_input("Mot de passe", type="password")
@@ -117,8 +116,8 @@ def main():
             st.rerun()
         return
 
-    # Titre et Logo
-    c_l, c_t = st.columns([1, 5])
+    # Titre
+    c_l, c_t = st.columns([1, 6])
     if LOGO_PATH.exists(): c_l.image(str(LOGO_PATH), width=70)
     c_t.title("Gestion de Caisse Scolaire")
 
@@ -127,43 +126,47 @@ def main():
         with tabs[i]:
             df = load_mouvements(mois)
             
-            # Résumé financier du mois
+            # 1. Sommes du mois
+            e_total = df['entree'].sum()
+            s_total = df['sortie'].sum()
             c1, c2, c3 = st.columns(3)
-            c1.metric("Entrées", f"{df['entree'].sum()} FCFA")
-            c2.metric("Sorties", f"{df['sortie'].sum()} FCFA")
-            c3.metric("Solde", f"{df['entree'].sum() - df['sortie'].sum()} FCFA")
+            c1.metric("Total Reçu", f"{e_total} FCFA")
+            c2.metric("Total Dépensé", f"{s_total} FCFA")
+            c3.metric("Solde Mensuel", f"{e_total - s_total} FCFA")
 
-            # Formulaire d'ajout
-            with st.expander(f"➕ Ajouter pour {mois}"):
-                with st.form(f"f_{mois}"):
+            # 2. Formulaire d'ajout
+            with st.expander(f"➕ Ajouter une opération"):
+                with st.form(f"form_{mois}", clear_on_submit=True):
                     d = st.date_input("Date", value=date.today())
                     n = st.text_input("Nom de l'élève")
                     cl = st.text_input("Classe")
-                    des = st.text_input("Désignation (ex: Inscription)")
-                    e = st.number_input("Entrée (Reçu)", min_value=0.0)
-                    s = st.number_input("Sortie (Dépense)", min_value=0.0)
+                    des = st.text_input("Désignation")
+                    ent = st.number_input("Somme Reçue", min_value=0.0)
+                    sor = st.number_input("Somme Sortie", min_value=0.0)
                     if st.form_submit_button("Enregistrer"):
-                        add_mouvement(mois, d, des, n, cl, e, s)
-                        st.success("Enregistré !")
-                        st.rerun()
+                        if n and des:
+                            add_mouvement(mois, d, des, n, cl, ent, sor)
+                            st.rerun()
 
+            # 3. Tableau et Actions
             if not df.empty:
                 st.dataframe(df[["id", "date", "nom", "designation", "entree", "sortie"]], hide_index=True, use_container_width=True)
                 
-                # Zone de suppression et PDF
                 col_a, col_b = st.columns(2)
                 with col_a:
-                    sel_del = st.selectbox("Choisir une ligne à supprimer", df["id"].tolist(), key=f"s_{mois}")
-                    if st.button("Supprimer la ligne", key=f"b_{mois}", type="primary"):
-                        delete_mouvement(sel_id := sel_del)
+                    st.subheader("Supprimer")
+                    sel_del = st.selectbox("Ligne à supprimer", df["id"].tolist(), key=f"del_{mois}")
+                    if st.button("Confirmer Suppression", key=f"bdel_{mois}", type="primary"):
+                        delete_mouvement(sel_del)
                         st.rerun()
                 with col_b:
-                    sel_pdf = st.selectbox("Choisir pour le reçu", df["id"].tolist(), key=f"p_{mois}")
-                    if st.button("Générer Reçu PDF", key=f"bp_{mois}"):
-                        row = df[df["id"] == sel_pdf].iloc[0]
-                        st.download_button("Télécharger", generate_receipt_pdf(row, mois), f"recu_{row.nom}.pdf")
+                    st.subheader("Imprimer")
+                    sel_pdf = st.selectbox("Reçu pour l'élève", df["id"].tolist(), key=f"pdf_{mois}")
+                    if st.button("Générer Reçu", key=f"bpdf_{mois}"):
+                        row_pdf = df[df["id"] == sel_pdf].iloc[0]
+                        st.download_button("Télécharger PDF", generate_receipt_pdf(row_pdf, mois), f"recu_{row_pdf.nom}.pdf")
             else:
-                st.info("Aucune opération.")
+                st.info("Aucune donnée pour ce mois.")
 
 if __name__ == "__main__":
     main()
