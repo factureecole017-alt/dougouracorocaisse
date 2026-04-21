@@ -21,10 +21,9 @@ MONTHS = [
     "Janvier", "Février", "Mars", "Avril", "Mai",
 ]
 
-# --- NOUVELLE CONNEXION GOOGLE SHEETS ---
+# --- CONNEXION GOOGLE SHEETS ---
 def get_sheet():
     try:
-        # Utilisation des secrets Streamlit pour la connexion
         creds_dict = json.loads(st.secrets["GCP_JSON"])
         if "private_key" in creds_dict:
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
@@ -32,15 +31,12 @@ def get_sheet():
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(creds)
-        
-        # Ouvre le document "Caisse Scolaire"
         return client.open("Caisse Scolaire").get_worksheet(0)
     except Exception as e:
-        st.error(f"Erreur de connexion Google Sheets : {e}")
+        st.error(f"Erreur de connexion : {e}")
         st.stop()
 
 def init_db():
-    # Avec Google Sheets, on vérifie juste que la ligne d'en-tête existe
     sheet = get_sheet()
     values = sheet.get_all_values()
     if not values:
@@ -49,8 +45,10 @@ def init_db():
 
 def add_mouvement(mois, movement_date, designation, nom, classe, entree, sortie):
     sheet = get_sheet()
-    # Calcul du prochain ID
-    next_id = len(sheet.get_all_values())
+    # MODIFICATION : On compte les lignes pour avoir un ID numérique (1, 2, 3...)
+    all_values = sheet.get_all_values()
+    next_id = len(all_values) # Si 1 ligne d'entête, la nouvelle sera la 2ème (ID=1)
+    
     sheet.append_row([
         next_id,
         mois,
@@ -65,10 +63,8 @@ def add_mouvement(mois, movement_date, designation, nom, classe, entree, sortie)
 def delete_mouvement(row_id):
     sheet = get_sheet()
     data = sheet.get_all_records()
-    # On cherche la ligne qui a cet ID (l'ID est en colonne 1, donc index 0)
     for i, row in enumerate(data):
         if int(row.get("id", 0)) == int(row_id):
-            # +2 car les index commencent à 0 et il y a l'en-tête
             sheet.delete_rows(i + 2)
             break
 
@@ -76,15 +72,10 @@ def load_mouvements(mois=None):
     sheet = get_sheet()
     records = sheet.get_all_records()
     df = pd.DataFrame(records)
-    
     if df.empty:
         return pd.DataFrame(columns=["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"])
-
-    # Filtrage par mois
     if mois:
         df = df[df["mois"] == mois]
-
-    # Formatage identique à ton code original
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df["entree"] = df["entree"].astype(float)
     df["sortie"] = df["sortie"].astype(float)
@@ -92,8 +83,7 @@ def load_mouvements(mois=None):
     df["solde_cumule"] = df["solde"].cumsum()
     return df
 
-# --- LE RESTE DU CODE (FONCTIONS PDF ET INTERFACE) RESTE INCHANGÉ ---
-
+# --- FONCTIONS PDF ---
 def clean_pdf_text(value):
     return str(value).encode("latin-1", "replace").decode("latin-1")
 
@@ -120,7 +110,6 @@ def add_pdf_header(pdf, title):
         logo_width = 36
         pdf.image(str(LOGO_PATH), x=(pdf.w - logo_width) / 2, y=10, w=logo_width)
         pdf.set_y(48)
-
     pdf.set_font("Helvetica", "B", 14)
     pdf.cell(0, 8, clean_pdf_text(SCHOOL_NAME), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
     pdf.set_font("Helvetica", "", 11)
@@ -133,12 +122,9 @@ def add_pdf_header(pdf, title):
 def add_direction_signature(pdf, compact=False):
     if compact:
         pdf.ln(6)
-        if pdf.get_y() > pdf.h - 42:
-            pdf.add_page()
-    elif pdf.get_y() > pdf.h - 55:
-        pdf.add_page()
-    if not compact:
-        pdf.set_y(pdf.h - 48)
+        if pdf.get_y() > pdf.h - 42: pdf.add_page()
+    elif pdf.get_y() > pdf.h - 55: pdf.add_page()
+    if not compact: pdf.set_y(pdf.h - 48)
     pdf.set_x(pdf.w - 100)
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(85, 8, "Direction", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
@@ -207,6 +193,7 @@ def format_table(df):
                                     "solde": "Solde", "solde_cumule": "Solde cumulé"})
     return display_df[["ID", "Date", "Désignation", "Nom", "Classe", "Entrée", "Sortie", "Solde", "Solde cumulé"]]
 
+# --- INTERFACE ---
 def check_password():
     if st.session_state.get("authenticated"): return True
     st.title("Connexion")
@@ -223,7 +210,7 @@ def check_password():
 def show_month(mois):
     st.subheader(mois)
     df = load_mouvements(mois)
-    st.download_button("Imprimer le résumé du mois", data=generate_monthly_summary_pdf(df, mois) if not df.empty else b"",
+    st.download_button("Imprimer le résumé", data=generate_monthly_summary_pdf(df, mois) if not df.empty else b"",
                        file_name=f"resume_{mois.lower()}.pdf", mime="application/pdf", disabled=df.empty, key=f"sum-{mois}")
     with st.form(f"form-{mois}", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
@@ -261,10 +248,17 @@ def main():
     st.set_page_config(page_title="Caisse scolaire", layout="wide")
     if not check_password(): return
     init_db()
-    st.title("Gestion de caisse scolaire")
+    
+    # MODIFICATION : Affichage du logo à côté du titre
+    col_logo, col_title = st.columns([1, 8])
+    if LOGO_PATH.exists():
+        col_logo.image(str(LOGO_PATH), width=80)
+    col_title.title("Gestion de caisse scolaire")
+    
     if st.sidebar.button("Se déconnecter"):
         st.session_state["authenticated"] = False
         st.rerun()
+    
     tabs = st.tabs(MONTHS)
     for tab, mois in zip(tabs, MONTHS):
         with tab: show_month(mois)
