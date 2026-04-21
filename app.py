@@ -15,35 +15,43 @@ LOGO_PATH = Path("logo.png")
 SCHOOL_NAME = "Complexe Scolaire Dougouracoro Sema"
 SCHOOL_PHONE = "Tél: 75172000"
 MONTHS = ["Septembre", "Octobre", "Novembre", "Décembre", "Janvier", "Février", "Mars", "Avril", "Mai"]
-
-# --- CONNEXION GOOGLE SHEETS (La partie modifiée) ---
+# 2. Fonction de connexion ROBUSTE
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 
-# 1. Définition des accès (Portée)
-scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+# 1. Définition des droits d'accès
+SCOPE = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
-# 2. Fonction de connexion ROBUSTE
 def get_sheet_client():
     try:
-        # On crée une copie des secrets pour pouvoir la modifier
-        # car on ne peut pas modifier st.secrets directement
+        # CRUCIAL : On crée une COPIE pour ne pas modifier st.secrets directement
         creds_dict = dict(st.secrets["gcp_service_account"])
         
-        # On nettoie la clé privée dans notre copie
+        # On nettoie la clé privée (gestion des sauts de ligne)
         if "private_key" in creds_dict:
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+        # Connexion à Google avec la copie propre
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
         return gspread.authorize(creds)
-    
     except Exception as e:
-        st.error(f"Erreur de configuration des secrets : {e}")
+        st.error(f"❌ Erreur de configuration : {e}")
         st.stop()
+
+def init_db():
+    try:
+        client = get_sheet_client()
+        # Assure-toi que le nom du fichier est EXACTEMENT celui-là dans ton Drive
+        sheet = client.open("Base_Donnees_Caisse").sheet1
+        return sheet
     except Exception as e:
-        st.error(f"Erreur de configuration des secrets : {e}")
+        st.error(f"❌ Impossible d'ouvrir le Google Sheet : {e}")
+        st.info("💡 Rappel : Partage ton fichier Excel avec l'adresse email de ton compte de service.")
         st.stop()
+
+# Lancement de la base de données
+sheet = init_db()
 
 # 3. Initialisation de la base de données
 def init_db():
