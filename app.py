@@ -16,6 +16,15 @@ hide_st_style = '''
             #MainMenu {visibility: hidden;}
             footer {visibility: hidden;}
             header {visibility: hidden;}
+            div[data-baseweb="tab-list"] {
+                overflow-x: auto !important;
+                flex-wrap: nowrap !important;
+                scrollbar-width: thin;
+            }
+            button[data-baseweb="tab"] {
+                white-space: nowrap !important;
+                flex-shrink: 0 !important;
+            }
             </style>
             '''
 st.markdown(hide_st_style, unsafe_allow_html=True)
@@ -25,6 +34,7 @@ DIRECTOR_PHONE = "+223 75172000"  # <-- Modifier ici le numero du directeur
 MONTHS = [
     "Septembre", "Octobre", "Novembre", "Décembre",
     "Janvier", "Février", "Mars", "Avril", "Mai",
+    "Juin", "Juillet", "Août",
 ]
 COLS = ["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"]
 NUM_COLS = ["entree", "sortie"]
