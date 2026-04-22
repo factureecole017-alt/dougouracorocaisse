@@ -4,15 +4,15 @@ import gspread
 from google.oauth2.service_account import Credentials
 import json
 from datetime import date
-from fpdf import FPDF
 import time
+from fpdf import FPDF
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Caisse scolaire", layout="wide")
 SCHOOL_NAME = "Complexe Scolaire Dougouracoro Sema"
 MONTHS = ["Septembre", "Octobre", "Novembre", "Décembre", "Janvier", "Février", "Mars", "Avril", "Mai"]
 
-# --- CONNEXION (SANS ERREUR 429) ---
+# --- CONNEXION ---
 def get_sheet():
     try:
         creds_dict = json.loads(st.secrets["GCP_JSON"])
@@ -21,49 +21,39 @@ def get_sheet():
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(creds)
-        # Petite pause pour éviter de saturer Google
-        time.sleep(0.5) 
         return client.open("Caisse Scolaire").get_worksheet(0)
     except Exception as e:
-        st.error(f"Erreur de connexion : {e}")
+        st.error(f"Erreur Google : {e}")
         return None
 
-# --- CHARGEMENT ROBUSTE ---
-def load_data(mois_cible=None):
+# --- CHARGEMENT DES DONNÉES ---
+def load_data(mois_selectionne):
     sheet = get_sheet()
     if not sheet: return pd.DataFrame()
     
-    # On lit TOUT sans se soucier des noms de colonnes (get_all_values)
-    all_values = sheet.get_all_values()
-    if len(all_values) <= 1:
+    # On récupère TOUTES les lignes
+    data = sheet.get_all_values()
+    if len(data) <= 1:
         return pd.DataFrame(columns=["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"])
     
-    # On force nos propres colonnes sur les données (on ignore la ligne 1 d'Excel)
-    df = pd.DataFrame(all_values[1:], columns=["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"])
+    # On force nos propres noms de colonnes pour éviter le 'KeyError'
+    df = pd.DataFrame(data[1:], columns=["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"])
     
-    # Conversion forcée en nombres pour les SOMMES
+    # On nettoie les montants (remplace le texte par 0 pour éviter le 'ValueError')
     df["entree"] = pd.to_numeric(df["entree"], errors='coerce').fillna(0)
     df["sortie"] = pd.to_numeric(df["sortie"], errors='coerce').fillna(0)
     
-    if mois_cible:
-        df = df[df["mois"] == mois_cible]
-    return df
+    # On filtre sur le mois
+    return df[df["mois"] == mois_selectionne]
 
 # --- ACTIONS ---
-def add_row(mois, d, des, nom, cl, e, s):
-    sheet = get_sheet()
-    if not sheet: return
-    # L'ID est basé sur l'heure pour être unique et éviter les erreurs de doublons
-    new_id = int(time.time())
-    sheet.append_row([str(new_id), mois, d.isoformat(), des, nom, cl, str(e), str(s)])
-
-def delete_row(row_id):
+def delete_item(item_id):
     sheet = get_sheet()
     if not sheet: return
     data = sheet.get_all_values()
     for i, row in enumerate(data):
         if i == 0: continue
-        if len(row) > 0 and str(row[0]) == str(row_id):
+        if len(row) > 0 and str(row[0]) == str(item_id):
             sheet.delete_rows(i + 1)
             break
 
@@ -77,54 +67,77 @@ def main():
             st.rerun()
         return
 
-    st.title("Gestion de Caisse")
-    
+    st.title("💰 Gestion de Caisse Scolaire")
+
     tabs = st.tabs(MONTHS)
     for i, mois in enumerate(MONTHS):
         with tabs[i]:
             df = load_data(mois)
             
-            # Sommes
-            e_total = df["entree"].sum()
-            s_total = df["sortie"].sum()
-            st.subheader(f"Total {mois}: {e_total - s_total} FCFA")
+            # 1. Résumé financier
+            total_e = df["entree"].sum()
+            total_s = df["sortie"].sum()
+            st.info(f"**Solde {mois} : {total_e - total_s} FCFA** (Entrées: {total_e} | Sorties: {total_s})")
 
-            # Formulaire
-            with st.expander("Ajouter une ligne"):
-                with st.form(f"f_{mois}"):
-                    d = st.date_input("Date", value=date.today())
-                    nom = st.text_input("Nom")
-                    cl = st.text_input("Classe")
-                    des = st.text_input("Désignation")
-                    ent = st.number_input("Entrée", min_value=0.0)
-                    sor = st.number_input("Sortie", min_value=0.0)
-                    if st.form_submit_button("Valider"):
-                        add_row(mois, d, des, nom, cl, ent, sor)
+            # 2. Formulaire d'ajout
+            with st.expander("➕ Ajouter une opération"):
+                with st.form(f"form_{mois}"):
+                    c1, c2 = st.columns(2)
+                    d = c1.date_input("Date", value=date.today())
+                    nom = c2.text_input("Nom de l'élève")
+                    cl = c1.text_input("Classe")
+                    des = c2.text_input("Désignation (ex: Mensualité)")
+                    ent = c1.number_input("Entrée (Somme reçue)", min_value=0.0)
+                    sor = c2.number_input("Sortie (Dépense)", min_value=0.0)
+                    
+                    if st.form_submit_button("Enregistrer dans Google Drive"):
+                        sheet = get_sheet()
+                        new_id = str(int(time.time())) # ID unique basé sur l'heure
+                        sheet.append_row([new_id, mois, d.isoformat(), des, nom, cl, str(ent), str(sor)])
+                        st.success("Enregistré !")
+                        time.sleep(1)
                         st.rerun()
 
+            # 3. Tableau et Outils
             if not df.empty:
-                st.dataframe(df[["id", "nom", "designation", "entree", "sortie"]], hide_index=True)
+                st.write("### Liste des opérations")
+                st.dataframe(df[["id", "date", "nom", "designation", "entree", "sortie"]], hide_index=True)
                 
-                # Suppression & Impression
-                c1, c2 = st.columns(2)
-                with c1:
-                    target = st.selectbox("Ligne à supprimer", df["id"].tolist(), key=f"d_{mois}")
-                    if st.button("Supprimer", key=f"bd_{mois}"):
-                        delete_row(target)
+                st.write("---")
+                colA, colB = st.columns(2)
+                
+                with colA:
+                    st.subheader("🗑️ Supprimer")
+                    id_to_del = st.selectbox("Choisir l'ID", df["id"].tolist(), key=f"del_{mois}")
+                    if st.button("Confirmer la suppression", key=f"bdel_{mois}", type="primary"):
+                        delete_item(id_to_del)
                         st.rerun()
-                with c2:
-                    target_p = st.selectbox("Ligne pour PDF", df["id"].tolist(), key=f"p_{mois}")
-                    if st.button("Imprimer Reçu", key=f"bp_{mois}"):
-                        row = df[df["id"] == target_p].iloc[0]
+                
+                with colB:
+                    st.subheader("📄 Imprimer")
+                    id_to_pdf = st.selectbox("Choisir l'élève", df["id"].tolist(), key=f"pdf_{mois}")
+                    if st.button("Générer Reçu PDF", key=f"bpdf_{mois}"):
+                        row = df[df["id"] == id_to_pdf].iloc[0]
                         pdf = FPDF()
                         pdf.add_page()
                         pdf.set_font("Arial", "B", 16)
-                        pdf.cell(0, 10, f"RECU: {row['nom']}", ln=True)
+                        pdf.cell(0, 10, SCHOOL_NAME, ln=True, align='C')
+                        pdf.ln(10)
+                        pdf.set_font("Arial", "B", 14)
+                        pdf.cell(0, 10, f"RECU DE CAISSE - {mois}", ln=True, align='C')
+                        pdf.ln(5)
                         pdf.set_font("Arial", "", 12)
-                        pdf.cell(0, 10, f"Montant: {row['entree'] + row['sortie']} FCFA", ln=True)
-                        st.download_button("Télécharger", pdf.output(dest='S'), f"recu_{row['nom']}.pdf")
+                        pdf.cell(0, 10, f"Date: {row['date']}", ln=True)
+                        pdf.cell(0, 10, f"Élève: {row['nom']} ({row['classe']})", ln=True)
+                        pdf.cell(0, 10, f"Motif: {row['designation']}", ln=True)
+                        montant = row['entree'] if row['entree'] > 0 else row['sortie']
+                        pdf.set_font("Arial", "B", 13)
+                        pdf.cell(0, 10, f"Montant: {montant} FCFA", ln=True)
+                        
+                        pdf_data = pdf.output(dest='S').encode('latin-1')
+                        st.download_button("⬇️ Télécharger le PDF", pdf_data, f"recu_{row['nom']}.pdf", "application/pdf")
             else:
-                st.write("Vide.")
+                st.info("Aucune donnée pour ce mois.")
 
 if __name__ == "__main__":
     main()
