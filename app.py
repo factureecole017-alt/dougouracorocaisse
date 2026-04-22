@@ -10,6 +10,15 @@ from fpdf import FPDF
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Caisse scolaire", layout="wide")
+
+hide_st_style = '''
+            <style>
+            #MainMenu {visibility: hidden;}
+            footer {visibility: hidden;}
+            header {visibility: hidden;}
+            </style>
+            '''
+st.markdown(hide_st_style, unsafe_allow_html=True)
 SCHOOL_NAME = "Complexe Scolaire Dougouracoro Sema"
 LOGO_PATH = "logo.png"
 DIRECTOR_PHONE = "+223 75172000"  # <-- Modifier ici le numero du directeur
