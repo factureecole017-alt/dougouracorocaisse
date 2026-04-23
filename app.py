@@ -130,6 +130,10 @@ def load_data(mois_selectionne):
     for col in ["id", "mois", "date", "designation", "nom", "classe"]:
         df[col] = df[col].astype(str).fillna("").str.strip()
 
+    # Colonne annee derivee de la date (tri automatique par annee de saisie)
+    parsed = pd.to_datetime(df["date"], errors="coerce")
+    df["annee"] = parsed.dt.year.fillna(0).astype(int)
+
     return df[df["mois"] == mois_selectionne].reset_index(drop=True)
 
 
@@ -248,6 +252,84 @@ def build_receipt_pdf(row):
     return bytes(output)
 
 
+
+def build_annual_report_pdf(df_year, mois, annee):
+    pdf = FPDF(format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    margin = 10
+    pdf.set_draw_color(0, 0, 0)
+    pdf.set_line_width(0.6)
+    pdf.rect(margin, margin, 210 - 2 * margin, 297 - 2 * margin)
+
+    if os.path.exists(LOGO_PATH):
+        try:
+            pdf.image(LOGO_PATH, x=margin + 5, y=margin + 5, w=22)
+        except Exception:
+            pass
+
+    pdf.set_xy(margin, margin + 8)
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 9, _safe(SCHOOL_NAME), ln=True, align="C")
+    pdf.set_font("Arial", "", 10)
+    pdf.cell(0, 5, _safe(f"Tel. Directeur : {DIRECTOR_PHONE}"), ln=True, align="C")
+    pdf.ln(3)
+    pdf.set_font("Arial", "B", 13)
+    pdf.cell(0, 8, _safe(f"RAPPORT ANNUEL - {mois} {annee}"), ln=True, align="C")
+    y = pdf.get_y()
+    pdf.set_line_width(0.4)
+    pdf.line(margin + 30, y, 210 - margin - 30, y)
+    pdf.ln(6)
+
+    # En-tete tableau
+    headers = [("Date", 25), ("Eleve", 45), ("Classe", 22), ("Motif", 50), ("Entree", 22), ("Sortie", 22)]
+    pdf.set_font("Arial", "B", 10)
+    pdf.set_fill_color(230, 230, 230)
+    for h, w in headers:
+        pdf.cell(w, 8, _safe(h), border=1, align="C", fill=True)
+    pdf.ln()
+
+    pdf.set_font("Arial", "", 9)
+    total_e = 0.0
+    total_s = 0.0
+    for _, r in df_year.iterrows():
+        pdf.cell(25, 7, _safe(r["date"]), border=1)
+        pdf.cell(45, 7, _safe(r["nom"])[:25], border=1)
+        pdf.cell(22, 7, _safe(r["classe"])[:12], border=1)
+        pdf.cell(50, 7, _safe(r["designation"])[:30], border=1)
+        pdf.cell(22, 7, _safe(f"{r['entree']:,.0f}".replace(",", " ")), border=1, align="R")
+        pdf.cell(22, 7, _safe(f"{r['sortie']:,.0f}".replace(",", " ")), border=1, align="R")
+        pdf.ln()
+        total_e += float(r["entree"])
+        total_s += float(r["sortie"])
+
+    # Totaux
+    pdf.set_font("Arial", "B", 10)
+    pdf.set_fill_color(245, 245, 245)
+    pdf.cell(142, 8, "TOTAUX", border=1, align="R", fill=True)
+    pdf.cell(22, 8, _safe(f"{total_e:,.0f}".replace(",", " ")), border=1, align="R", fill=True)
+    pdf.cell(22, 8, _safe(f"{total_s:,.0f}".replace(",", " ")), border=1, align="R", fill=True)
+    pdf.ln(12)
+
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 9, _safe(f"SOLDE : {total_e - total_s:,.0f} FCFA".replace(",", " ")), ln=True, align="C")
+
+    # Signature
+    pdf.ln(15)
+    pdf.set_x(210 - margin - 80)
+    pdf.set_font("Arial", "", 11)
+    pdf.cell(75, 6, "_______________________________", ln=True, align="C")
+    pdf.set_x(210 - margin - 80)
+    pdf.set_font("Arial", "B", 11)
+    pdf.cell(75, 6, "Signature du Directeur", ln=True, align="C")
+
+    output = pdf.output(dest="S")
+    if isinstance(output, str):
+        return output.encode("latin-1", "replace")
+    return bytes(output)
+
+
 # --- INTERFACE ---
 def login_screen():
     col_logo, col_title = st.columns([1, 4])
@@ -288,11 +370,14 @@ def main():
         st.title(SCHOOL_NAME)
         st.caption("Gestion de la caisse scolaire")
 
+    current_year = date.today().year
     tabs = st.tabs(MONTHS)
     for i, mois in enumerate(MONTHS):
         with tabs[i]:
-            df = load_data(mois)
+            df_all = load_data(mois)
+            df = df_all[df_all["annee"] == current_year].reset_index(drop=True)
 
+            st.markdown(f"**Année en cours : {current_year}**")
             t_e = float(df["entree"].sum()) if not df.empty else 0.0
             t_s = float(df["sortie"].sum()) if not df.empty else 0.0
             c1, c2, c3 = st.columns(3)
@@ -324,52 +409,128 @@ def main():
                                 st.error(f"Erreur enregistrement : {e}")
 
             if df.empty:
-                st.info("Aucune donnée pour ce mois.")
-                continue
+                st.info(f"Aucune donnée pour {mois} {current_year}.")
+            else:
+                st.dataframe(
+                    df[["date", "nom", "classe", "designation", "entree", "sortie"]],
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
-            st.dataframe(
-                df[["date", "nom", "classe", "designation", "entree", "sortie"]],
-                hide_index=True,
-                use_container_width=True,
-            )
+                st.divider()
+                ids = df["id"].tolist()
+                target_id = st.selectbox(
+                    "Choisir une opération",
+                    ids,
+                    format_func=lambda x: (
+                        f"{df.loc[df['id']==x,'nom'].values[0]} - "
+                        f"{df.loc[df['id']==x,'designation'].values[0]}"
+                    ),
+                    key=f"sel_{mois}",
+                )
 
+                a, b = st.columns(2)
+                if a.button("🗑️ Supprimer", key=f"del_{mois}", type="primary"):
+                    if delete_item(target_id):
+                        st.success("Opération supprimée.")
+                        time.sleep(0.8)
+                        st.rerun()
+                    else:
+                        st.error("Suppression impossible (ID introuvable).")
+
+                pdf_key = f"pdf_bytes_{mois}_{target_id}"
+                if b.button("📄 Préparer le reçu PDF", key=f"pdf_{mois}"):
+                    row = df[df["id"] == target_id].iloc[0]
+                    st.session_state[pdf_key] = (
+                        build_receipt_pdf(row),
+                        f"recu_{row['id']}_{row['nom']}.pdf",
+                    )
+                if pdf_key in st.session_state:
+                    pdf_bytes, fname = st.session_state[pdf_key]
+                    st.download_button(
+                        "⬇️ Télécharger le reçu",
+                        data=pdf_bytes,
+                        file_name=fname,
+                        mime="application/pdf",
+                        key=f"dl_{mois}_{target_id}",
+                    )
+
+            # --- Archives des annees precedentes ---
             st.divider()
-            ids = df["id"].tolist()
-            target_id = st.selectbox(
-                "Choisir une opération",
-                ids,
-                format_func=lambda x: (
-                    f"{df.loc[df['id']==x,'nom'].values[0]} - "
-                    f"{df.loc[df['id']==x,'designation'].values[0]}"
-                ),
-                key=f"sel_{mois}",
+            archive_years = sorted(
+                [int(y) for y in df_all["annee"].unique() if int(y) > 0 and int(y) != current_year],
+                reverse=True,
             )
-
-            a, b = st.columns(2)
-            if a.button("🗑️ Supprimer", key=f"del_{mois}", type="primary"):
-                if delete_item(target_id):
-                    st.success("Opération supprimée.")
-                    time.sleep(0.8)
-                    st.rerun()
+            with st.expander("🗂️ Archives des années précédentes"):
+                if not archive_years:
+                    st.info("Aucune archive disponible pour ce mois.")
                 else:
-                    st.error("Suppression impossible (ID introuvable).")
+                    sel_year = st.selectbox(
+                        "Choisir une année",
+                        archive_years,
+                        key=f"arc_y_{mois}",
+                    )
+                    df_arc = df_all[df_all["annee"] == sel_year].reset_index(drop=True)
 
-            pdf_key = f"pdf_bytes_{mois}_{target_id}"
-            if b.button("📄 Préparer le reçu PDF", key=f"pdf_{mois}"):
-                row = df[df["id"] == target_id].iloc[0]
-                st.session_state[pdf_key] = (
-                    build_receipt_pdf(row),
-                    f"recu_{row['id']}_{row['nom']}.pdf",
-                )
-            if pdf_key in st.session_state:
-                pdf_bytes, fname = st.session_state[pdf_key]
-                st.download_button(
-                    "⬇️ Télécharger le reçu",
-                    data=pdf_bytes,
-                    file_name=fname,
-                    mime="application/pdf",
-                    key=f"dl_{mois}_{target_id}",
-                )
+                    a_e = float(df_arc["entree"].sum())
+                    a_s = float(df_arc["sortie"].sum())
+                    ac1, ac2, ac3 = st.columns(3)
+                    ac1.metric("Entrées", f"{a_e:,.0f} FCFA")
+                    ac2.metric("Sorties", f"{a_s:,.0f} FCFA")
+                    ac3.metric("Solde", f"{a_e - a_s:,.0f} FCFA")
+
+                    st.dataframe(
+                        df_arc[["date", "nom", "classe", "designation", "entree", "sortie"]],
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+                    # Rapport annuel du mois
+                    rep_key = f"rep_bytes_{mois}_{sel_year}"
+                    if st.button("📊 Imprimer le rapport annuel", key=f"rep_{mois}_{sel_year}"):
+                        st.session_state[rep_key] = (
+                            build_annual_report_pdf(df_arc, mois, sel_year),
+                            f"rapport_{mois}_{sel_year}.pdf",
+                        )
+                    if rep_key in st.session_state:
+                        rb, rf = st.session_state[rep_key]
+                        st.download_button(
+                            "⬇️ Télécharger le rapport",
+                            data=rb,
+                            file_name=rf,
+                            mime="application/pdf",
+                            key=f"dlrep_{mois}_{sel_year}",
+                        )
+
+                    # Recu individuel dans les archives
+                    if not df_arc.empty:
+                        st.markdown("**Reçu individuel :**")
+                        arc_ids = df_arc["id"].tolist()
+                        arc_target = st.selectbox(
+                            "Choisir un élève",
+                            arc_ids,
+                            format_func=lambda x: (
+                                f"{df_arc.loc[df_arc['id']==x,'nom'].values[0]} - "
+                                f"{df_arc.loc[df_arc['id']==x,'designation'].values[0]}"
+                            ),
+                            key=f"arc_sel_{mois}_{sel_year}",
+                        )
+                        arc_pdf_key = f"arc_pdf_{mois}_{sel_year}_{arc_target}"
+                        if st.button("📄 Préparer le reçu", key=f"arc_pdfbtn_{mois}_{sel_year}"):
+                            arow = df_arc[df_arc["id"] == arc_target].iloc[0]
+                            st.session_state[arc_pdf_key] = (
+                                build_receipt_pdf(arow),
+                                f"recu_{arow['id']}_{arow['nom']}.pdf",
+                            )
+                        if arc_pdf_key in st.session_state:
+                            apb, apf = st.session_state[arc_pdf_key]
+                            st.download_button(
+                                "⬇️ Télécharger le reçu",
+                                data=apb,
+                                file_name=apf,
+                                mime="application/pdf",
+                                key=f"arc_dl_{mois}_{sel_year}_{arc_target}",
+                            )
 
 
 if __name__ == "__main__":
