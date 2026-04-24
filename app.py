@@ -468,28 +468,37 @@ def main():
                     sel_year = st.selectbox(
                         "Choisir une année",
                         archive_years,
-                        key=f"arc_y_{mois}",
+                        key=f"select_annee_{mois}",
                     )
-                    df_arc = df_all[df_all["annee"] == sel_year].reset_index(drop=True)
 
-                    a_e = float(df_arc["entree"].sum())
-                    a_s = float(df_arc["sortie"].sum())
+                    # Filtre l\'annee + reconversion numerique de securite (anciennes donnees)
+                    df_archive = df_all[df_all["annee"] == sel_year].copy().reset_index(drop=True)
+                    for col in ["entree", "sortie"]:
+                        df_archive[col] = pd.to_numeric(
+                            df_archive[col].astype(str).str.replace(",", ".").str.strip(),
+                            errors="coerce",
+                        ).fillna(0)
+
+                    a_e = float(df_archive["entree"].sum())
+                    a_s = float(df_archive["sortie"].sum())
                     ac1, ac2, ac3 = st.columns(3)
                     ac1.metric("Entrées", f"{a_e:,.0f} FCFA")
                     ac2.metric("Sorties", f"{a_s:,.0f} FCFA")
                     ac3.metric("Solde", f"{a_e - a_s:,.0f} FCFA")
 
+                    # Tableau actualise pour l\'annee selectionnee (key dependant de l\'annee)
                     st.dataframe(
-                        df_arc[["date", "nom", "classe", "designation", "entree", "sortie"]],
+                        df_archive[["date", "nom", "classe", "designation", "entree", "sortie"]],
                         hide_index=True,
                         use_container_width=True,
+                        key=f"table_archive_{mois}_{sel_year}",
                     )
 
                     # Rapport annuel du mois
                     rep_key = f"rep_bytes_{mois}_{sel_year}"
                     if st.button("📊 Imprimer le rapport annuel", key=f"rep_{mois}_{sel_year}"):
                         st.session_state[rep_key] = (
-                            build_annual_report_pdf(df_arc, mois, sel_year),
+                            build_annual_report_pdf(df_archive, mois, sel_year),
                             f"rapport_{mois}_{sel_year}.pdf",
                         )
                     if rep_key in st.session_state:
@@ -503,34 +512,44 @@ def main():
                         )
 
                     # Recu individuel dans les archives
-                    if not df_arc.empty:
+                    if not df_archive.empty:
                         st.markdown("**Reçu individuel :**")
-                        arc_ids = df_arc["id"].tolist()
-                        arc_target = st.selectbox(
+                        # Liste des noms de l\'annee selectionnee
+                        noms = sorted(df_archive["nom"].unique().tolist())
+                        nom_choisi = st.selectbox(
                             "Choisir un élève",
-                            arc_ids,
-                            format_func=lambda x: (
-                                f"{df_arc.loc[df_arc['id']==x,'nom'].values[0]} - "
-                                f"{df_arc.loc[df_arc['id']==x,'designation'].values[0]}"
-                            ),
-                            key=f"arc_sel_{mois}_{sel_year}",
+                            noms,
+                            key=f"select_eleve_{sel_year}_{mois}",
                         )
-                        arc_pdf_key = f"arc_pdf_{mois}_{sel_year}_{arc_target}"
-                        if st.button("📄 Préparer le reçu", key=f"arc_pdfbtn_{mois}_{sel_year}"):
-                            arow = df_arc[df_arc["id"] == arc_target].iloc[0]
-                            st.session_state[arc_pdf_key] = (
-                                build_receipt_pdf(arow),
-                                f"recu_{arow['id']}_{arow['nom']}.pdf",
+                        # Operations de cet eleve dans l\'annee
+                        df_eleve = df_archive[df_archive["nom"] == nom_choisi].reset_index(drop=True)
+                        op_ids = df_eleve["id"].tolist()
+                        if op_ids:
+                            arc_target = st.selectbox(
+                                "Choisir l\'opération",
+                                op_ids,
+                                format_func=lambda x: (
+                                    f"{df_eleve.loc[df_eleve['id']==x,'date'].values[0]} - "
+                                    f"{df_eleve.loc[df_eleve['id']==x,'designation'].values[0]}"
+                                ),
+                                key=f"select_op_{sel_year}_{mois}",
                             )
-                        if arc_pdf_key in st.session_state:
-                            apb, apf = st.session_state[arc_pdf_key]
-                            st.download_button(
-                                "⬇️ Télécharger le reçu",
-                                data=apb,
-                                file_name=apf,
-                                mime="application/pdf",
-                                key=f"arc_dl_{mois}_{sel_year}_{arc_target}",
-                            )
+                            arc_pdf_key = f"arc_pdf_{mois}_{sel_year}_{arc_target}"
+                            if st.button("📄 Préparer le reçu", key=f"arc_pdfbtn_{mois}_{sel_year}_{arc_target}"):
+                                arow = df_eleve[df_eleve["id"] == arc_target].iloc[0]
+                                st.session_state[arc_pdf_key] = (
+                                    build_receipt_pdf(arow),
+                                    f"recu_{arow['id']}_{arow['nom']}.pdf",
+                                )
+                            if arc_pdf_key in st.session_state:
+                                apb, apf = st.session_state[arc_pdf_key]
+                                st.download_button(
+                                    "⬇️ Télécharger le reçu",
+                                    data=apb,
+                                    file_name=apf,
+                                    mime="application/pdf",
+                                    key=f"arc_dl_{mois}_{sel_year}_{arc_target}",
+                                )
 
 
 if __name__ == "__main__":
