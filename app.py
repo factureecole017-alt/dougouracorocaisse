@@ -18,14 +18,21 @@ SCHOOL_PHONE = "Tél: 75172000"
 MONTHS = ["Septembre", "Octobre", "Novembre", "Décembre", "Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août"]
 
 # --- CACHE DES DONNÉES POUR ÉVITER LES ERREURS ---
+import json # Assure-toi que 'import json' est bien en haut du fichier
+
 def get_sheet_client():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    # Utilise le secret configuré dans Streamlit
-    creds = Credentials.from_service_account_info(st.secrets["GCP_JSON"], scopes=scope)
+    
+    # On récupère le secret
+    service_account_info = st.secrets["gcp_service_account"]
+    
+    # Si le secret arrive sous forme de texte (str), on le transforme en dictionnaire
+    if isinstance(service_account_info, str):
+        service_account_info = json.loads(service_account_info)
+        
+    creds = Credentials.from_service_account_info(service_account_info, scopes=scope)
     client = gspread.authorize(creds)
-    # Assure-toi que ce nom correspond exactement à ton fichier Google Sheets
     return client.open("Base_Donnees_Caisse").sheet1
-
 def load_mouvements(mois=None):
     try:
         sheet = get_sheet_client()
