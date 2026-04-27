@@ -1,241 +1,218 @@
 import streamlit as st
+import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-import pandas as pd
+import json
 import os
-import re
-from pathlib import Path
-import unicodedata
-from datetime import datetime, date
+from datetime import date
+import time
 from fpdf import FPDF
-from fpdf.enums import XPos, YPos
 
-# --- CONFIGURATION INITIALE ---
-LOGO_PATH = Path("logo.png")
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Caisse scolaire", layout="wide")
+
+hide_st_style = '''
+            <style>
+            #MainMenu {visibility: hidden;}
+            footer {visibility: hidden;}
+            header {visibility: hidden;}
+            div[data-baseweb="tab-list"] {
+                overflow-x: auto !important;
+                flex-wrap: nowrap !important;
+                scrollbar-width: thin;
+            }
+            button[data-baseweb="tab"] {
+                white-space: nowrap !important;
+                flex-shrink: 0 !important;
+            }
+            </style>
+            '''
+st.markdown(hide_st_style, unsafe_allow_html=True)
+
 SCHOOL_NAME = "Complexe Scolaire Dougouracoro Sema"
-SCHOOL_PHONE = "Tél: 75172000"
-# Liste complète des mois
+LOGO_PATH = "logo.png"
+DIRECTOR_PHONE = "+223 75172000"
 MONTHS = ["Septembre", "Octobre", "Novembre", "Décembre", "Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août"]
+COLS = ["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"]
+NUM_COLS = ["entree", "sortie"]
 
-# --- CACHE DES DONNÉES POUR ÉVITER LES ERREURS ---
-import json # Assure-toi que 'import json' est bien en haut du fichier
-
-def get_sheet_client():
-    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    
-    # On récupère le secret
-    service_account_info = st.secrets["gcp_service_account"]
-    
-    # Si le secret arrive sous forme de texte (str), on le transforme en dictionnaire
-    if isinstance(service_account_info, str):
-        service_account_info = json.loads(service_account_info)
-        
-    creds = Credentials.from_service_account_info(service_account_info, scopes=scope)
-    client = gspread.authorize(creds)
-    return client.open("Base_Donnees_Caisse").sheet1
-def load_mouvements(mois=None):
+# --- CHARGEMENT SÉCURISÉ DES SECRETS ---
+def _load_gcp_credentials():
     try:
-        sheet = get_sheet_client()
-        records = sheet.get_all_records()
-        df = pd.DataFrame(records)
+        # On essaie d'abord de lire le secret comme un dictionnaire direct
+        raw = st.secrets["GCP_JSON"]
+        if isinstance(raw, dict):
+            return dict(raw)
         
-        if df.empty:
-            return df
-
-        # Conversion forcée en numérique pour éviter les sommes à "0"
-        df['entree'] = pd.to_numeric(df['entree'], errors='coerce').fillna(0)
-        df['sortie'] = pd.to_numeric(df['sortie'], errors='coerce').fillna(0)
+        # Si c'est une chaîne, on la nettoie et on la décode
+        text = str(raw).strip()
+        creds_dict = json.loads(text, strict=False)
         
-        # Gestion des dates pour l'extraction de l'année (utile pour les archives)
-        df['date_dt'] = pd.to_datetime(df['date'], errors='coerce')
-        df['annee'] = df['date_dt'].dt.year.fillna(0).astype(int)
+        # Correction spécifique pour la clé privée
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            
+        return creds_dict
+    except Exception as e:
+        st.error(f"Erreur technique de clé : {e}")
+        return None
 
-        # Calcul du solde par ligne pour le tableau
-        df['solde'] = df['entree'] - df['sortie']
-        df['solde_cumule'] = df['solde'].cumsum()
+# --- CONNEXION GOOGLE SHEETS ---
+@st.cache_resource(show_spinner=False)
+def get_sheet():
+    try:
+        creds_dict = _load_gcp_credentials()
+        if not creds_dict:
+            return None
+            
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        # Assure-toi que le nom du fichier est exact
+        return client.open("Caisse Scolaire").get_worksheet(0)
+    except Exception as e:
+        st.error(f"Erreur de connexion : {e}")
+        return None
 
-        if mois:
-            df = df[df['mois'] == mois]
+# --- CHARGEMENT DES DONNÉES ---
+def load_data(mois_selectionne):
+    sheet = get_sheet()
+    if sheet is None: return pd.DataFrame(columns=COLS)
+
+    try:
+        data = sheet.get_all_values()
+        if not data or len(data) <= 1:
+            return pd.DataFrame(columns=COLS)
+
+        # Transformation en DataFrame
+        df = pd.DataFrame(data[1:], columns=COLS)
         
-        return df
+        # Conversion numérique
+        for col in NUM_COLS:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "."), errors="coerce").fillna(0)
+
+        # Extraction de l'année pour les archives
+        parsed_dates = pd.to_datetime(df["date"], errors="coerce")
+        df["annee"] = parsed_dates.dt.year.fillna(0).astype(int)
+
+        return df[df["mois"] == mois_selectionne].reset_index(drop=True)
     except Exception as e:
         st.error(f"Erreur de lecture : {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=COLS)
 
-def add_mouvement(mois, movement_date, designation, nom, classe, entree, sortie):
-    sheet = get_sheet_client()
-    new_id = len(sheet.get_all_values())
-    sheet.append_row([
-        new_id, 
-        mois, 
-        movement_date.isoformat(), 
-        designation.strip(), 
-        nom.strip(), 
-        classe.strip(), 
-        float(entree or 0), 
-        float(sortie or 0)
-    ])
-
-def delete_mouvement(row_id):
-    sheet = get_sheet_client()
-    data = sheet.get_all_records()
-    for index, row in enumerate(data):
-        if str(row['id']) == str(row_id):
-            sheet.delete_rows(index + 2) # +2 car header + index 0
-            return True
-    return False
-
-# --- FONCTIONS PDF (CORRIGÉES) ---
-def clean_pdf_text(value):
-    return str(value).encode("latin-1", "replace").decode("latin-1")
-
-def money(value):
-    return f"{float(value or 0):,.0f} FCFA".replace(",", " ")
-
-def pdf_to_bytes(pdf):
-    # CORRECTION CRITIQUE ICI pour éviter l'erreur TypeError
+# --- SUPPRESSION ---
+def delete_item(item_id):
+    sheet = get_sheet()
+    if sheet is None: return False
     try:
-        return bytes(pdf.output())
+        data = sheet.get_all_values()
+        target = str(item_id).strip()
+        for i, row in enumerate(data):
+            if i > 0 and str(row[0]).strip() == target:
+                sheet.delete_rows(i + 1)
+                return True
+        return False
     except:
-        return pdf.output(dest='S').encode('latin-1')
+        return False
 
-def generate_receipt_pdf(row, mois):
+# --- PDF HELPERS ---
+def _safe(text):
+    return str(text).encode("latin-1", "replace").decode("latin-1")
+
+def build_receipt_pdf(row):
     pdf = FPDF()
     pdf.add_page()
-    # Logo et Header
-    if LOGO_PATH.exists():
-        pdf.image(str(LOGO_PATH), x=87, y=10, w=36)
-        pdf.ln(40)
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, clean_pdf_text(SCHOOL_NAME), align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Helvetica", "", 12)
-    pdf.cell(0, 10, clean_pdf_text("Reçu de Paiement"), align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, _safe(SCHOOL_NAME), ln=True, align="C")
     pdf.ln(10)
-    
-    amount = row.entree if float(row.entree) > 0 else row.sortie
-    fields = [("ID Reçu", row.id), ("Date", row.date), ("Nom", row.nom), ("Classe", row.classe), ("Motif", row.designation), ("Montant", money(amount))]
-    
-    for label, val in fields:
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(40, 10, f"{label}: ", 0)
-        pdf.set_font("Helvetica", "", 12)
-        pdf.cell(0, 10, clean_pdf_text(val), 0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    
-    pdf.ln(20)
-    pdf.set_font("Helvetica", "I", 10)
-    pdf.cell(0, 10, f"Fait à Bamako, le {date.today()}", align="R")
-    return pdf_to_bytes(pdf)
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, "RECU DE PAIEMENT", ln=True, align="C")
+    pdf.ln(5)
+    pdf.set_font("Arial", "", 12)
+    pdf.cell(0, 10, _safe(f"Eleve : {row['nom']}"), ln=True)
+    pdf.cell(0, 10, _safe(f"Classe : {row['classe']}"), ln=True)
+    pdf.cell(0, 10, _safe(f"Motif : {row['designation']}"), ln=True)
+    montant = row["entree"] if row["entree"] > 0 else row["sortie"]
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 15, _safe(f"MONTANT : {montant:,.0f} FCFA"), ln=True)
+    return bytes(pdf.output())
 
-# --- INTERFACE UTILISATEUR ---
+# --- INTERFACE ---
 def main():
-    st.set_page_config(page_title="Gestion Caisse Dougouracoro", layout="wide")
-    
-    # Masquer le style Streamlit pour faire pro
-    hide_st_style = """
-                <style>
-                #MainMenu {visibility: hidden;}
-                footer {visibility: hidden;}
-                header {visibility: hidden;}
-                </style>
-                """
-    st.markdown(hide_st_style, unsafe_allow_html=True)
-
-    # Mot de passe
     if "auth" not in st.session_state:
         st.session_state.auth = False
     
     if not st.session_state.auth:
-        pwd = st.text_input("Entrez le mot de passe Direction", type="password")
-        if pwd == st.secrets["MON_MOT_DE_PASSE"]:
-            st.session_state.auth = True
-            st.rerun()
+        st.title(SCHOOL_NAME)
+        pwd = st.text_input("Mot de passe", type="password")
+        if st.button("Connexion"):
+            if pwd == st.secrets.get("MON_MOT_DE_PASSE"):
+                st.session_state.auth = True
+                st.rerun()
         return
 
     st.title(f"📂 {SCHOOL_NAME}")
-
-    # --- 1. TABLEAU DE BORD GLOBAL (Nouveauté) ---
-    df_global = load_mouvements()
-    if not df_global.empty:
-        t_entrees = df_global['entree'].sum()
-        t_sorties = df_global['sortie'].sum()
-        solde_actuel = t_entrees - t_sorties
-        
-        st.info("### 📊 SITUATION GÉNÉRALE DE LA CAISSE")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("TOTAL ENTRÉES", money(t_entrees))
-        c2.metric("TOTAL SORTIES", money(t_sorties))
-        c3.metric("SOLDE GLOBAL", money(solde_actuel))
-        st.divider()
-
-    # --- 2. GESTION PAR MOIS ---
+    
+    current_year = date.today().year
     tabs = st.tabs(MONTHS)
+    
     for i, mois in enumerate(MONTHS):
         with tabs[i]:
-            st.subheader(f"Mouvement de {mois}")
+            df_all = load_data(mois)
+            df = df_all[df_all["annee"] == current_year].reset_index(drop=True)
             
-            # Formulaire d'ajout
-            with st.expander(f"➕ Ajouter une opération en {mois}"):
-                with st.form(f"form_{mois}"):
-                    col1, col2 = st.columns(2)
-                    m_date = col1.date_input("Date", value=date.today())
-                    m_nom = col1.text_input("Nom de l'élève")
-                    m_classe = col1.text_input("Classe")
-                    m_desig = col2.text_input("Désignation / Motif")
-                    m_entree = col2.number_input("Entrée (Somme reçue)", min_value=0, step=500)
-                    m_sortie = col2.number_input("Sortie (Dépense)", min_value=0, step=500)
-                    
-                    if st.form_submit_button("Enregistrer l'opération"):
-                        add_mouvement(mois, m_date, m_desig, m_nom, m_classe, m_entree, m_sortie)
-                        st.success("Enregistré dans le Cloud !")
+            # --- Résumé financier ---
+            t_e = df["entree"].sum() if not df.empty else 0
+            t_s = df["sortie"].sum() if not df.empty else 0
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Entrées", f"{t_e:,.0f} FCFA")
+            c2.metric("Sorties", f"{t_s:,.0f} FCFA")
+            c3.metric("Solde", f"{t_e - t_s:,.0f} FCFA")
+
+            # --- Formulaire ---
+            with st.expander("➕ Nouvelle opération"):
+                with st.form(f"f_{mois}", clear_on_submit=True):
+                    d = st.date_input("Date", value=date.today())
+                    nom = st.text_input("Nom de l'élève")
+                    cl = st.text_input("Classe")
+                    des = st.text_input("Désignation")
+                    ent = st.number_input("Entrée", min_value=0.0)
+                    sor = st.number_input("Sortie", min_value=0.0)
+                    if st.form_submit_button("Enregistrer"):
+                        sheet = get_sheet()
+                        if sheet:
+                            sheet.append_row([str(int(time.time())), mois, d.isoformat(), des, nom, cl, str(ent), str(sor)])
+                            st.success("Enregistré !")
+                            time.sleep(1)
+                            st.rerun()
+
+            # --- Tableau ---
+            if not df.empty:
+                st.dataframe(df[["date", "nom", "classe", "designation", "entree", "sortie"]], use_container_width=True)
+                
+                # --- Actions ---
+                target_id = st.selectbox("Choisir une ligne", df["id"].tolist(), key=f"s_{mois}")
+                col_a, col_b = st.columns(2)
+                if col_a.button("🗑️ Supprimer", key=f"d_{mois}"):
+                    if delete_item(target_id):
+                        st.success("Supprimé !")
                         st.rerun()
-
-            # Affichage des données du mois
-            df_mois = load_mouvements(mois)
-            
-            if not df_mois.empty:
-                # Séparer année actuelle et archives
-                annee_actuelle = date.today().year
-                df_current = df_mois[df_mois['annee'] == annee_actuelle]
-                df_archives = df_mois[df_mois['annee'] < annee_actuelle]
-
-                st.write(f"**Opérations en cours ({annee_actuelle})**")
-                st.dataframe(df_current[['id', 'date', 'nom', 'classe', 'designation', 'entree', 'sortie']], hide_index=True)
-
-                # --- 3. SYSTÈME D'ARCHIVES ---
-                if not df_archives.empty:
-                    with st.expander("📁 Consulter les Archives (Années précédentes)"):
-                        annees_dispo = sorted(df_archives['annee'].unique(), reverse=True)
-                        sel_year = st.selectbox("Choisir l'année à consulter", annees_dispo, key=f"yr_{mois}")
-                        
-                        df_view = df_archives[df_archives['annee'] == sel_year]
-                        st.write(f"Données de l'année {sel_year} :")
-                        st.table(df_view[['id', 'date', 'nom', 'designation', 'entree', 'sortie']])
-                        
-                        # Suppression dans les archives
-                        st.warning("Zone de suppression")
-                        id_del = st.selectbox("ID à supprimer", df_view['id'].tolist(), key=f"del_sel_{mois}_{sel_year}")
-                        if st.button("Supprimer cette ligne définitivement", key=f"btn_del_{mois}_{sel_year}"):
-                            if delete_mouvement(id_del):
-                                st.success("Supprimé !")
-                                st.rerun()
                 
-                # --- 4. REÇUS ---
-                st.divider()
-                st.subheader("🖨️ Impression de Reçu")
-                all_names = df_mois['nom'].unique()
-                sel_nom = st.selectbox("Chercher un élève", all_names, key=f"print_nom_{mois}")
-                
-                # On prend la dernière opération de cet élève
-                row_eleve = df_mois[df_mois['nom'] == sel_nom].iloc[-1]
-                st.download_button(
-                    label=f"Télécharger le reçu de {sel_nom}",
-                    data=generate_receipt_pdf(row_eleve, mois),
-                    file_name=f"Recu_{sel_nom}_{mois}.pdf",
-                    mime="application/pdf",
-                    key=f"dl_{row_eleve.id}"
-                )
-            else:
-                st.info(f"Aucune donnée pour {mois}.")
+                if col_b.button("📄 Reçu PDF", key=f"p_{mois}"):
+                    row = df[df["id"] == target_id].iloc[0]
+                    pdf_bytes = build_receipt_pdf(row)
+                    st.download_button("⬇️ Télécharger", data=pdf_bytes, file_name=f"recu_{target_id}.pdf", mime="application/pdf")
+
+            # --- Archives ---
+            st.divider()
+            with st.expander("🗂️ Archives des années précédentes"):
+                archive_years = sorted([y for y in df_all["annee"].unique() if y > 0 and y != current_year], reverse=True)
+                if archive_years:
+                    sel_y = st.selectbox("Année", archive_years, key=f"ay_{mois}")
+                    df_arch = df_all[df_all["annee"] == sel_y]
+                    st.dataframe(df_arch[["date", "nom", "designation", "entree", "sortie"]], use_container_width=True)
+                else:
+                    st.info("Aucune archive.")
 
 if __name__ == "__main__":
     main()
