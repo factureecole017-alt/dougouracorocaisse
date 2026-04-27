@@ -40,6 +40,11 @@ MONTHS = [
 ]
 COLS = ["id", "mois", "date", "designation", "nom", "classe", "entree", "sortie"]
 NUM_COLS = ["entree", "sortie"]
+MONTH_INDEX = {
+    "Septembre": 9, "Octobre": 10, "Novembre": 11, "Décembre": 12,
+    "Janvier": 1, "Février": 2, "Mars": 3, "Avril": 4, "Mai": 5,
+    "Juin": 6, "Juillet": 7, "Août": 8,
+}
 
 
 # --- CHARGEMENT SÉCURISÉ DES SECRETS ---
@@ -178,7 +183,10 @@ def _to_number(val):
 
 
 def _normalize_df(df):
-    """Force types corrects sur toutes les colonnes."""
+    """Force types corrects sur toutes les colonnes.
+    Gère les dates manquantes : par défaut le 1er du mois (année courante)
+    et affiche 'Date non spécifiée' dans les tableaux.
+    """
     for c in COLS:
         if c not in df.columns:
             df[c] = ""
@@ -192,8 +200,26 @@ def _normalize_df(df):
     for col in ["id", "mois", "date", "designation", "nom", "classe"]:
         df[col] = df[col].astype(str).fillna("").str.strip()
 
+    # Tentative de parsing de la date
     parsed = pd.to_datetime(df["date"], errors="coerce")
-    df["annee"] = parsed.dt.year.fillna(0).astype(int)
+
+    current_year = date.today().year
+
+    # Année : si la date est invalide/vide, on rattache à l'année courante
+    # (pour que les opérations apparaissent dans la vue active du mois).
+    df["annee"] = parsed.dt.year.where(parsed.notna(), current_year).astype(int)
+
+    # Date affichée : "Date non spécifiée" si non parsable
+    df["date_affichage"] = df["date"]
+    df.loc[parsed.isna(), "date_affichage"] = "Date non spécifiée"
+
+    # Date triable (pour reçus PDF et tris) : 1er du mois si manquante
+    def _fallback_date(row):
+        m_idx = MONTH_INDEX.get(row["mois"], 1)
+        return pd.Timestamp(year=current_year, month=m_idx, day=1)
+
+    fallback = df.apply(_fallback_date, axis=1)
+    df["date_triable"] = parsed.where(parsed.notna(), fallback)
     return df
 
 
@@ -249,6 +275,42 @@ def delete_item(item_id):
     return False
 
 
+# --- MODIFICATION PAR ID UNIQUE ---
+def update_item(item_id, updates):
+    """Met à jour les champs d'une ligne identifiée par son id (1ère colonne).
+    `updates` est un dict {nom_colonne: valeur}."""
+    sheet = get_sheet()
+    if sheet is None:
+        return False
+    try:
+        data = sheet.get_all_values()
+    except Exception as e:
+        st.error(f"Erreur lecture Sheet : {e}")
+        return False
+
+    target = str(item_id).strip()
+    for i, row in enumerate(data):
+        if i == 0:
+            continue
+        if len(row) > 0 and str(row[0]).strip() == target:
+            sheet_row = i + 1
+            row = list(row) + [""] * (len(COLS) - len(row))
+            new_row = row[: len(COLS)]
+            for col, val in updates.items():
+                if col in COLS:
+                    new_row[COLS.index(col)] = str(val)
+            try:
+                sheet.update(
+                    f"A{sheet_row}:{chr(ord('A') + len(COLS) - 1)}{sheet_row}",
+                    [new_row],
+                )
+                return True
+            except Exception as e:
+                st.error(f"Erreur mise à jour : {e}")
+                return False
+    return False
+
+
 # --- NETTOYAGE DES LIGNES VIDES OU TESTS ---
 def cleanup_empty_rows():
     """Supprime les lignes considérées comme vides ou tests :
@@ -279,6 +341,51 @@ def cleanup_empty_rows():
             indices_to_delete.append(i + 1)  # +1 car gspread est 1-indexé
 
     # Supprime de la fin vers le début pour garder les indices valides
+    deleted = 0
+    for sheet_row in sorted(indices_to_delete, reverse=True):
+        try:
+            sheet.delete_rows(sheet_row)
+            deleted += 1
+        except Exception:
+            pass
+    return deleted
+
+
+# --- NETTOYAGE FORCÉ DES LIGNES INCOMPLÈTES ---
+def cleanup_incomplete_rows():
+    """Nettoyage forcé : supprime toutes les lignes incomplètes
+       - aucun nom, OU
+       - aucun montant (entree=0 ET sortie=0), OU
+       - ligne complètement vide
+    Retourne le nombre de lignes supprimées."""
+    sheet = get_sheet()
+    if sheet is None:
+        return 0
+    try:
+        data = sheet.get_all_values()
+    except Exception as e:
+        st.error(f"Erreur lecture Sheet : {e}")
+        return 0
+
+    if not data or len(data) <= 1:
+        return 0
+
+    indices_to_delete = []
+    for i, row in enumerate(data):
+        if i == 0:
+            continue
+        row = list(row) + [""] * (len(COLS) - len(row))
+        nom = str(row[4]).strip() if len(row) > 4 else ""
+        des = str(row[3]).strip() if len(row) > 3 else ""
+        ent = _to_number(row[6] if len(row) > 6 else 0)
+        sor = _to_number(row[7] if len(row) > 7 else 0)
+        # Incomplet si : pas de nom OU pas de montant OU ligne vide
+        is_empty = not nom and not des and ent == 0 and sor == 0
+        no_name = not nom
+        no_amount = ent == 0 and sor == 0
+        if is_empty or no_name or no_amount:
+            indices_to_delete.append(i + 1)
+
     deleted = 0
     for sheet_row in sorted(indices_to_delete, reverse=True):
         try:
@@ -339,7 +446,7 @@ def build_receipt_pdf(row):
         pdf.cell(0, line_h, _safe(value), ln=True)
 
     details("Recu N° :", row["id"])
-    details("Date :", row["date"])
+    details("Date :", row.get("date_affichage", row.get("date", "")) or "Date non spécifiée")
     details("Mois :", row.get("mois", ""))
     details("Eleve :", row["nom"])
     details("Classe :", row["classe"])
@@ -413,7 +520,7 @@ def build_annual_report_pdf(df_year, mois, annee):
     total_e = 0.0
     total_s = 0.0
     for _, r in df_year.iterrows():
-        pdf.cell(25, 7, _safe(r["date"]), border=1)
+        pdf.cell(25, 7, _safe(r.get("date_affichage", r.get("date", "")) or "Date non spécifiée"), border=1)
         pdf.cell(45, 7, _safe(r["nom"])[:25], border=1)
         pdf.cell(22, 7, _safe(r["classe"])[:12], border=1)
         pdf.cell(50, 7, _safe(r["designation"])[:30], border=1)
@@ -534,6 +641,28 @@ def main():
             time.sleep(0.8)
             st.rerun()
 
+        st.markdown("---")
+        st.write(
+            "**Nettoyage forcé** : supprime aussi toutes les lignes incomplètes "
+            "(pas de nom OU pas de montant). À utiliser avec précaution."
+        )
+        force_confirm = st.checkbox(
+            "Je confirme vouloir lancer le nettoyage forcé",
+            key="force_cleanup_confirm",
+        )
+        if st.button(
+            "🔥 Nettoyage Forcé (lignes incomplètes)",
+            type="primary",
+            disabled=not force_confirm,
+        ):
+            n = cleanup_incomplete_rows()
+            if n > 0:
+                st.success(f"{n} ligne(s) incomplète(s) supprimée(s).")
+            else:
+                st.info("Aucune ligne incomplète à supprimer.")
+            time.sleep(0.8)
+            st.rerun()
+
     current_year = date.today().year
     tabs = st.tabs(MONTHS)
     for i, mois in enumerate(MONTHS):
@@ -575,8 +704,10 @@ def main():
             if df.empty:
                 st.info(f"Aucune donnée pour {mois} {current_year}.")
             else:
+                df_disp = df.copy()
+                df_disp["date"] = df_disp["date_affichage"]
                 st.dataframe(
-                    df[["date", "nom", "classe", "designation", "entree", "sortie"]],
+                    df_disp[["date", "nom", "classe", "designation", "entree", "sortie"]],
                     hide_index=True,
                     use_container_width=True,
                 )
@@ -593,7 +724,7 @@ def main():
                     key=f"sel_{mois}",
                 )
 
-                a, b = st.columns(2)
+                a, b, c = st.columns(3)
                 if a.button("🗑️ Supprimer", key=f"del_{mois}", type="primary"):
                     if delete_item(target_id):
                         st.success("Opération supprimée.")
@@ -602,8 +733,12 @@ def main():
                     else:
                         st.error("Suppression impossible (ID introuvable).")
 
+                edit_key = f"edit_open_{mois}_{target_id}"
+                if b.button("✏️ Modifier", key=f"editbtn_{mois}_{target_id}"):
+                    st.session_state[edit_key] = True
+
                 pdf_key = f"pdf_bytes_{mois}_{target_id}"
-                if b.button("📄 Préparer le reçu PDF", key=f"pdf_{mois}"):
+                if c.button("📄 Préparer le reçu PDF", key=f"pdf_{mois}"):
                     row = df[df["id"] == target_id].iloc[0]
                     st.session_state[pdf_key] = (
                         build_receipt_pdf(row),
@@ -618,6 +753,56 @@ def main():
                         mime="application/pdf",
                         key=f"dl_{mois}_{target_id}",
                     )
+
+                # --- Formulaire de modification ---
+                if st.session_state.get(edit_key):
+                    row = df[df["id"] == target_id].iloc[0]
+                    with st.form(f"edit_form_{mois}_{target_id}"):
+                        st.markdown("**Modifier l'opération**")
+                        try:
+                            d_default = pd.to_datetime(row["date"]).date()
+                        except Exception:
+                            d_default = date.today()
+                        e_d = st.date_input("Date", value=d_default, key=f"e_d_{target_id}")
+                        e_mois = st.selectbox(
+                            "Mois", MONTHS,
+                            index=MONTHS.index(row["mois"]) if row["mois"] in MONTHS else MONTHS.index(mois),
+                            key=f"e_m_{target_id}",
+                        )
+                        e_nom = st.text_input("Nom de l'élève", value=row["nom"], key=f"e_n_{target_id}")
+                        e_cl = st.text_input("Classe", value=row["classe"], key=f"e_c_{target_id}")
+                        e_des = st.text_input("Désignation", value=row["designation"], key=f"e_des_{target_id}")
+                        e_ent = st.number_input(
+                            "Entrée (FCFA)", min_value=0.0, step=500.0,
+                            value=float(row["entree"]), key=f"e_ent_{target_id}",
+                        )
+                        e_sor = st.number_input(
+                            "Sortie (FCFA)", min_value=0.0, step=500.0,
+                            value=float(row["sortie"]), key=f"e_sor_{target_id}",
+                        )
+                        col_s, col_c = st.columns(2)
+                        save = col_s.form_submit_button("💾 Enregistrer", type="primary")
+                        cancel = col_c.form_submit_button("Annuler")
+                        if save:
+                            ok = update_item(target_id, {
+                                "date": e_d.isoformat(),
+                                "mois": e_mois,
+                                "nom": e_nom,
+                                "classe": e_cl,
+                                "designation": e_des,
+                                "entree": str(e_ent),
+                                "sortie": str(e_sor),
+                            })
+                            if ok:
+                                st.session_state[edit_key] = False
+                                st.success("Opération modifiée.")
+                                time.sleep(0.8)
+                                st.rerun()
+                            else:
+                                st.error("Modification impossible (ID introuvable).")
+                        if cancel:
+                            st.session_state[edit_key] = False
+                            st.rerun()
 
             # --- Archives des années précédentes ---
             st.divider()
@@ -644,44 +829,120 @@ def main():
                     ac2.metric("Sorties", fmt_fcfa(a_s))
                     ac3.metric("Solde", fmt_fcfa(a_e - a_s))
 
+                    df_arc_disp = df_archive.copy()
+                    df_arc_disp["date"] = df_arc_disp["date_affichage"]
                     st.dataframe(
-                        df_archive[["date", "nom", "classe", "designation", "entree", "sortie"]],
+                        df_arc_disp[["date", "nom", "classe", "designation", "entree", "sortie"]],
                         hide_index=True,
                         use_container_width=True,
                         key=f"table_archive_{mois}_{sel_year}",
                     )
 
-                    # --- SUPPRESSION dans les archives ---
+                    # --- SUPPRESSION + MODIFICATION dans les archives ---
                     if not df_archive.empty:
-                        st.markdown("**Supprimer une opération archivée :**")
+                        st.markdown("**Gérer une opération archivée :**")
                         arc_ids = df_archive["id"].tolist()
-                        del_target = st.selectbox(
-                            "Choisir l'opération à supprimer",
+                        arc_target = st.selectbox(
+                            "Choisir l'opération",
                             arc_ids,
                             format_func=lambda x: (
-                                f"{df_archive.loc[df_archive['id']==x,'date'].values[0]} - "
+                                f"{df_archive.loc[df_archive['id']==x,'date_affichage'].values[0]} - "
                                 f"{df_archive.loc[df_archive['id']==x,'nom'].values[0]} - "
                                 f"{df_archive.loc[df_archive['id']==x,'designation'].values[0]}"
                             ),
-                            key=f"arc_del_sel_{mois}_{sel_year}",
+                            key=f"arc_sel_{mois}_{sel_year}",
                         )
+
+                        arc_a, arc_b, arc_c = st.columns(3)
+                        arc_edit_key = f"arc_edit_open_{mois}_{sel_year}_{arc_target}"
+                        arc_pdf_key2 = f"arc_pdf2_{mois}_{sel_year}_{arc_target}"
+
+                        if arc_b.button("✏️ Modifier", key=f"arc_editbtn_{mois}_{sel_year}_{arc_target}"):
+                            st.session_state[arc_edit_key] = True
+
+                        if arc_c.button("📄 Préparer le reçu", key=f"arc_pdfbtn2_{mois}_{sel_year}_{arc_target}"):
+                            arow = df_archive[df_archive["id"] == arc_target].iloc[0]
+                            st.session_state[arc_pdf_key2] = (
+                                build_receipt_pdf(arow),
+                                f"recu_{arow['id']}_{arow['nom']}.pdf",
+                            )
+                        if arc_pdf_key2 in st.session_state:
+                            apb, apf = st.session_state[arc_pdf_key2]
+                            st.download_button(
+                                "⬇️ Télécharger le reçu",
+                                data=apb,
+                                file_name=apf,
+                                mime="application/pdf",
+                                key=f"arc_dl2_{mois}_{sel_year}_{arc_target}",
+                            )
+
                         confirm_key = f"arc_del_confirm_{mois}_{sel_year}"
                         confirm = st.checkbox(
                             "Je confirme vouloir supprimer définitivement cette ligne",
                             key=confirm_key,
                         )
-                        if st.button(
+                        if arc_a.button(
                             "🗑️ Supprimer définitivement",
                             key=f"arc_del_btn_{mois}_{sel_year}",
                             type="primary",
                             disabled=not confirm,
                         ):
-                            if delete_item(del_target):
+                            if delete_item(arc_target):
                                 st.success("Opération archivée supprimée.")
                                 time.sleep(0.8)
                                 st.rerun()
                             else:
                                 st.error("Suppression impossible (ID introuvable).")
+
+                        # --- Formulaire de modification (archives) ---
+                        if st.session_state.get(arc_edit_key):
+                            arow = df_archive[df_archive["id"] == arc_target].iloc[0]
+                            with st.form(f"arc_edit_form_{mois}_{sel_year}_{arc_target}"):
+                                st.markdown("**Modifier l'opération archivée**")
+                                try:
+                                    ad_default = pd.to_datetime(arow["date"]).date()
+                                except Exception:
+                                    ad_default = date.today()
+                                ae_d = st.date_input("Date", value=ad_default, key=f"ae_d_{arc_target}")
+                                ae_mois = st.selectbox(
+                                    "Mois", MONTHS,
+                                    index=MONTHS.index(arow["mois"]) if arow["mois"] in MONTHS else MONTHS.index(mois),
+                                    key=f"ae_m_{arc_target}",
+                                )
+                                ae_nom = st.text_input("Nom de l'élève", value=arow["nom"], key=f"ae_n_{arc_target}")
+                                ae_cl = st.text_input("Classe", value=arow["classe"], key=f"ae_c_{arc_target}")
+                                ae_des = st.text_input("Désignation", value=arow["designation"], key=f"ae_des_{arc_target}")
+                                ae_ent = st.number_input(
+                                    "Entrée (FCFA)", min_value=0.0, step=500.0,
+                                    value=float(arow["entree"]), key=f"ae_ent_{arc_target}",
+                                )
+                                ae_sor = st.number_input(
+                                    "Sortie (FCFA)", min_value=0.0, step=500.0,
+                                    value=float(arow["sortie"]), key=f"ae_sor_{arc_target}",
+                                )
+                                cs, cc = st.columns(2)
+                                asave = cs.form_submit_button("💾 Enregistrer", type="primary")
+                                acancel = cc.form_submit_button("Annuler")
+                                if asave:
+                                    ok = update_item(arc_target, {
+                                        "date": ae_d.isoformat(),
+                                        "mois": ae_mois,
+                                        "nom": ae_nom,
+                                        "classe": ae_cl,
+                                        "designation": ae_des,
+                                        "entree": str(ae_ent),
+                                        "sortie": str(ae_sor),
+                                    })
+                                    if ok:
+                                        st.session_state[arc_edit_key] = False
+                                        st.success("Opération modifiée.")
+                                        time.sleep(0.8)
+                                        st.rerun()
+                                    else:
+                                        st.error("Modification impossible (ID introuvable).")
+                                if acancel:
+                                    st.session_state[arc_edit_key] = False
+                                    st.rerun()
 
                     # Rapport annuel du mois
                     rep_key = f"rep_bytes_{mois}_{sel_year}"
@@ -716,7 +977,7 @@ def main():
                                 "Choisir l'opération",
                                 op_ids,
                                 format_func=lambda x: (
-                                    f"{df_eleve.loc[df_eleve['id']==x,'date'].values[0]} - "
+                                    f"{df_eleve.loc[df_eleve['id']==x,'date_affichage'].values[0]} - "
                                     f"{df_eleve.loc[df_eleve['id']==x,'designation'].values[0]}"
                                 ),
                                 key=f"select_op_{sel_year}_{mois}",
