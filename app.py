@@ -581,8 +581,11 @@ def render_rows_with_actions(df, mois, key_prefix):
         h[i].markdown(f"**{t}**")
     st.markdown("---")
 
-    for _, row in df.iterrows():
-        rid = row["id"]
+    for idx, (_, row) in enumerate(df.iterrows()):
+        rid = str(row.get("id", "") or "").strip()
+        # Compteur idx + ID = clé toujours unique, même si l'ID est vide ou dupliqué
+        uniq = f"{key_prefix}_{idx}_{rid}"
+
         c = st.columns(col_widths)
         c[0].write(row.get("date_affichage", "") or "Date non spécifiée")
         c[1].write(row.get("nom", ""))
@@ -592,13 +595,13 @@ def render_rows_with_actions(df, mois, key_prefix):
         c[5].write(fmt_fcfa(float(row.get("sortie", 0) or 0)))
 
         a1, a2, a3 = c[6].columns(3)
-        edit_key = f"row_edit_open_{key_prefix}_{rid}"
-        pdf_key = f"row_pdf_{key_prefix}_{rid}"
+        edit_key = f"row_edit_open_{uniq}"
+        pdf_key = f"row_pdf_{uniq}"
 
-        if a1.button("✏️", key=f"row_editbtn_{key_prefix}_{rid}", help="Modifier"):
+        if a1.button("✏️", key=f"row_editbtn_{uniq}", help="Modifier"):
             st.session_state[edit_key] = True
 
-        if a2.button("🗑️", key=f"row_delbtn_{key_prefix}_{rid}", help="Supprimer définitivement du Google Sheet"):
+        if a2.button("🗑️", key=f"row_delbtn_{uniq}", help="Supprimer définitivement du Google Sheet"):
             if delete_item(rid):
                 st.success(f"Ligne « {row.get('nom','')} » supprimée du Sheet.")
                 time.sleep(0.6)
@@ -606,10 +609,10 @@ def render_rows_with_actions(df, mois, key_prefix):
             else:
                 st.error("Suppression impossible (ID introuvable dans le Sheet).")
 
-        if a3.button("📄", key=f"row_pdfbtn_{key_prefix}_{rid}", help="Préparer le reçu PDF"):
+        if a3.button("📄", key=f"row_pdfbtn_{uniq}", help="Préparer le reçu PDF"):
             st.session_state[pdf_key] = (
                 build_receipt_pdf(row),
-                f"recu_{row['id']}_{row['nom']}.pdf",
+                f"recu_{rid or idx}_{row.get('nom','')}.pdf",
             )
 
         if pdf_key in st.session_state:
@@ -619,33 +622,33 @@ def render_rows_with_actions(df, mois, key_prefix):
                 data=pb,
                 file_name=pf,
                 mime="application/pdf",
-                key=f"row_dl_{key_prefix}_{rid}",
+                key=f"row_dl_{uniq}",
             )
 
         # --- Formulaire d'édition par ligne ---
         if st.session_state.get(edit_key):
-            with st.form(f"row_edit_form_{key_prefix}_{rid}"):
+            with st.form(f"row_edit_form_{uniq}"):
                 st.markdown(f"**Modifier la ligne de {row.get('nom','')}**")
                 try:
                     d_default = pd.to_datetime(row["date"]).date()
                 except Exception:
                     d_default = date.today()
-                e_d = st.date_input("Date", value=d_default, key=f"re_d_{key_prefix}_{rid}")
+                e_d = st.date_input("Date", value=d_default, key=f"re_d_{uniq}")
                 e_mois = st.selectbox(
                     "Mois", MONTHS,
                     index=MONTHS.index(row["mois"]) if row["mois"] in MONTHS else MONTHS.index(mois),
-                    key=f"re_m_{key_prefix}_{rid}",
+                    key=f"re_m_{uniq}",
                 )
-                e_nom = st.text_input("Nom", value=row["nom"], key=f"re_n_{key_prefix}_{rid}")
-                e_cl = st.text_input("Classe", value=row["classe"], key=f"re_c_{key_prefix}_{rid}")
-                e_des = st.text_input("Désignation", value=row["designation"], key=f"re_des_{key_prefix}_{rid}")
+                e_nom = st.text_input("Nom", value=row["nom"], key=f"re_n_{uniq}")
+                e_cl = st.text_input("Classe", value=row["classe"], key=f"re_c_{uniq}")
+                e_des = st.text_input("Désignation", value=row["designation"], key=f"re_des_{uniq}")
                 e_ent = st.number_input(
                     "Entrée (FCFA)", min_value=0.0, step=500.0,
-                    value=float(row["entree"] or 0), key=f"re_ent_{key_prefix}_{rid}",
+                    value=float(row["entree"] or 0), key=f"re_ent_{uniq}",
                 )
                 e_sor = st.number_input(
                     "Sortie (FCFA)", min_value=0.0, step=500.0,
-                    value=float(row["sortie"] or 0), key=f"re_sor_{key_prefix}_{rid}",
+                    value=float(row["sortie"] or 0), key=f"re_sor_{uniq}",
                 )
                 cs, cc = st.columns(2)
                 save = cs.form_submit_button("💾 Enregistrer", type="primary")
