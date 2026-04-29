@@ -227,44 +227,62 @@ def _normalize_df(df):
 # --- CHARGEMENT BLINDÉ DE TOUTES LES DONNÉES (mis en cache) ---
 @st.cache_data(show_spinner="Chargement des données…")
 def load_all_data():
-    """Lit absolument TOUTES les lignes du Google Sheet.
-    Mis en cache : ne ré-interroge le Sheet que si le cache est invalidé
-    (bouton 'Actualiser' ou après tout enregistrement / suppression / édition)."""
+    """Lit ABSOLUMENT TOUTES les lignes du Google Sheet via get_all_records().
+    Stratégie : on prend les enregistrements bruts, on aligne les colonnes,
+    puis on garde toute ligne ayant AU MOINS un nom OU un montant.
+    Mis en cache : ne ré-interroge le Sheet qu'après une invalidation
+    (bouton 'Actualiser' ou écriture : enregistrement / suppression / édition)."""
     sheet = get_sheet()
     if sheet is None:
         return pd.DataFrame(columns=COLS + ["annee"])
 
+    df = None
+
+    # 1) Tentative principale : get_all_records() (plus robuste, basé sur l'en-tête)
     try:
-        data = sheet.get_all_values()
-    except Exception as e:
-        st.error(f"Erreur lecture Sheet : {e}")
+        records = sheet.get_all_records(default_blank="")
+        if records:
+            df = pd.DataFrame(records)
+            # Normalise les noms de colonnes (insensible à la casse / espaces)
+            df.columns = [str(c).strip().lower() for c in df.columns]
+            for c in COLS:
+                if c not in df.columns:
+                    df[c] = ""
+            df = df[COLS]
+    except Exception:
+        df = None  # on tombera sur le fallback
+
+    # 2) Fallback : lecture brute en cas d'en-têtes manquants/dupliqués
+    if df is None:
+        try:
+            data = sheet.get_all_values()
+        except Exception as e:
+            st.error(f"Erreur lecture Sheet : {e}")
+            return pd.DataFrame(columns=COLS + ["annee"])
+        if not data or len(data) <= 1:
+            return pd.DataFrame(columns=COLS + ["annee"])
+        rows = []
+        for r in data[1:]:
+            r = list(r) + [""] * (len(COLS) - len(r))
+            rows.append(r[: len(COLS)])
+        df = pd.DataFrame(rows, columns=COLS)
+
+    if df is None or df.empty:
         return pd.DataFrame(columns=COLS + ["annee"])
 
-    if not data or len(data) <= 1:
-        return pd.DataFrame(columns=COLS + ["annee"])
-
-    rows = []
-    for r in data[1:]:
-        r = list(r) + [""] * (len(COLS) - len(r))
-        rows.append(r[: len(COLS)])
-
-    df = pd.DataFrame(rows, columns=COLS)
     df = _normalize_df(df)
     df = _apply_strict_filter(df)
     return df
 
 
 def _apply_strict_filter(df):
-    """Nettoyage automatique en mémoire : ne supprime QUE les lignes totalement
-    vides (aucun nom ET aucune désignation ET aucun montant).
-    On garde donc toute ligne ayant au moins un montant — même si la date ou
-    le nom sont incomplets — pour ne perdre aucune donnée du Google Sheet."""
+    """Filtre minimal : garde toute ligne ayant AU MOINS un nom OU un montant.
+    Supprime uniquement les lignes totalement vides (fantômes du Sheet)."""
     if df is None or df.empty:
         return df
     nom_ok = df["nom"].astype(str).str.strip().ne("")
-    des_ok = df["designation"].astype(str).str.strip().ne("")
     montant_ok = (df["entree"].fillna(0) > 0) | (df["sortie"].fillna(0) > 0)
-    return df[nom_ok | des_ok | montant_ok].reset_index(drop=True)
+    return df[nom_ok | montant_ok].reset_index(drop=True)
 
 
 def load_data(mois_selectionne):
@@ -274,12 +292,46 @@ def load_data(mois_selectionne):
 
 # --- INVALIDATION DU CACHE ---
 def _invalidate_cache():
-    """Vide le cache des données pour forcer un rechargement frais
-    depuis le Google Sheet au prochain appel de load_all_data()."""
+    """Vide TOUT le cache des données pour forcer un rechargement frais
+    depuis le Google Sheet au prochain appel de load_all_data().
+    Appelle aussi st.cache_data.clear() pour purger d'éventuels caches résiduels."""
     try:
         load_all_data.clear()
     except Exception:
         pass
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
+# --- ENREGISTREMENT D'UNE NOUVELLE OPÉRATION ---
+def save_entry(mois, d, nom, classe, designation, entree, sortie):
+    """Ajoute simplement une nouvelle ligne à la fin du Google Sheet
+    et invalide le cache pour que la donnée soit visible immédiatement.
+    Retourne True si l'écriture a réussi."""
+    sheet = get_sheet()
+    if sheet is None:
+        st.error("Connexion au Google Sheet indisponible.")
+        return False
+    try:
+        new_id = str(int(time.time() * 1000))
+        date_iso = d.isoformat() if hasattr(d, "isoformat") else str(d)
+        sheet.append_row([
+            new_id,
+            str(mois or ""),
+            date_iso,
+            str(designation or ""),
+            str(nom or ""),
+            str(classe or ""),
+            str(float(entree or 0)),
+            str(float(sortie or 0)),
+        ])
+        _invalidate_cache()
+        return True
+    except Exception as e:
+        st.error(f"Erreur enregistrement : {e}")
+        return False
 
 
 # --- SUPPRESSION PAR ID UNIQUE ---
@@ -953,9 +1005,61 @@ def main():
             st.rerun()
 
     # ============================================================
-    # 3) ONGLETS MENSUELS (Septembre → Août) FILTRÉS SUR L'ANNÉE
+    # 3) FORMULAIRE D'ENREGISTREMENT — EN HAUT, TOUJOURS VISIBLE
     # ============================================================
     is_current_year = (sel_year == current_year)
+
+    # Détermine le mois actuel (en français) pour pré-sélectionner dans le formulaire
+    today_m = date.today().month
+    default_mois = next(
+        (m for m in MONTHS if MONTH_INDEX.get(m) == today_m),
+        MONTHS[0],
+    )
+
+    if is_current_year:
+        with st.expander("➕ Nouvelle opération", expanded=False):
+            with st.form("form_new_entry", clear_on_submit=True):
+                fc1, fc2 = st.columns(2)
+                with fc1:
+                    f_date = st.date_input("Date", value=date.today(), key="ne_date")
+                    f_mois = st.selectbox(
+                        "Mois",
+                        MONTHS,
+                        index=MONTHS.index(default_mois),
+                        key="ne_mois",
+                    )
+                    f_nom = st.text_input("Nom de l'élève", key="ne_nom")
+                    f_classe = st.text_input("Classe", key="ne_classe")
+                with fc2:
+                    f_des = st.text_input("Désignation", key="ne_des")
+                    f_entree = st.number_input(
+                        "Entrée (FCFA)", min_value=0.0, step=500.0, key="ne_entree"
+                    )
+                    f_sortie = st.number_input(
+                        "Sortie (FCFA)", min_value=0.0, step=500.0, key="ne_sortie"
+                    )
+                submitted = st.form_submit_button("💾 Enregistrer", type="primary")
+                if submitted:
+                    if not f_nom.strip() and f_entree == 0 and f_sortie == 0:
+                        st.warning("Veuillez renseigner au moins un nom ou un montant.")
+                    elif save_entry(
+                        f_mois, f_date, f_nom, f_classe, f_des, f_entree, f_sortie
+                    ):
+                        st.success(
+                            f"✅ Opération enregistrée pour {f_mois} {f_date.year}. "
+                            "Ouvrez l'onglet correspondant pour la voir."
+                        )
+                        time.sleep(0.6)
+                        st.rerun()
+    else:
+        st.caption(
+            f"📁 Année archivée ({sel_year}) — l'ajout de nouvelles opérations "
+            f"n'est possible que pour l'année en cours ({current_year})."
+        )
+
+    # ============================================================
+    # 4) ONGLETS MENSUELS (Septembre → Août) FILTRÉS SUR L'ANNÉE
+    # ============================================================
     tabs = st.tabs(MONTHS)
     for i, mois in enumerate(MONTHS):
         with tabs[i]:
@@ -968,37 +1072,6 @@ def main():
             c1.metric("Entrées", fmt_fcfa(t_e))
             c2.metric("Sorties", fmt_fcfa(t_s))
             c3.metric("Solde", fmt_fcfa(t_e - t_s))
-
-            # Formulaire d'ajout : seulement pour l'année en cours
-            if is_current_year:
-                with st.expander("➕ Nouvelle opération"):
-                    with st.form(f"f_{mois}_{sel_year}", clear_on_submit=True):
-                        d = st.date_input("Date", value=date.today())
-                        nom = st.text_input("Nom de l'élève")
-                        cl = st.text_input("Classe")
-                        des = st.text_input("Désignation")
-                        ent = st.number_input("Entrée (FCFA)", min_value=0.0, step=500.0)
-                        sor = st.number_input("Sortie (FCFA)", min_value=0.0, step=500.0)
-                        if st.form_submit_button("Enregistrer", type="primary"):
-                            sheet = get_sheet()
-                            if sheet is not None:
-                                new_id = str(int(time.time()))
-                                try:
-                                    sheet.append_row([
-                                        new_id, mois, d.isoformat(), des, nom, cl,
-                                        str(ent), str(sor),
-                                    ])
-                                    _invalidate_cache()
-                                    st.success("Opération enregistrée.")
-                                    time.sleep(0.6)
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Erreur enregistrement : {e}")
-            else:
-                st.caption(
-                    f"📁 Année archivée — l'ajout de nouvelles opérations n'est possible "
-                    f"que pour l'année en cours ({current_year})."
-                )
 
             # Tableau des opérations + boutons par ligne (Modifier / Supprimer / Reçu PDF)
             if df.empty:
