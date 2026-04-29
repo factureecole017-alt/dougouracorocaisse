@@ -200,8 +200,15 @@ def _normalize_df(df):
     for col in ["id", "mois", "date", "designation", "nom", "classe"]:
         df[col] = df[col].astype(str).fillna("").str.strip()
 
-    # Tentative de parsing de la date
-    parsed = pd.to_datetime(df["date"], errors="coerce")
+    # Tentative de parsing de la date — TRÈS robuste :
+    # 1) format européen / français (jour d'abord : 05/12/2021)
+    # 2) format ISO ou US pour les valeurs restantes (2021-12-05, 12/5/2021)
+    raw_dates = df["date"].astype(str).str.strip()
+    parsed = pd.to_datetime(raw_dates, errors="coerce", dayfirst=True)
+    mask_unparsed = parsed.isna() & raw_dates.ne("")
+    if mask_unparsed.any():
+        parsed_iso = pd.to_datetime(raw_dates[mask_unparsed], errors="coerce")
+        parsed.loc[mask_unparsed] = parsed_iso
 
     current_year = date.today().year
 
@@ -238,9 +245,9 @@ def load_all_data():
 
     df = None
 
-    # 1) Tentative principale : get_all_records() (plus robuste, basé sur l'en-tête)
+    # 1) Tentative principale : get_all_records(head=1) — full scan, en-tête en ligne 1
     try:
-        records = sheet.get_all_records(default_blank="")
+        records = sheet.get_all_records(head=1, default_blank="")
         if records:
             df = pd.DataFrame(records)
             # Normalise les noms de colonnes (insensible à la casse / espaces)
@@ -872,7 +879,17 @@ def main():
     current_year = date.today().year
 
     # ============================================================
-    # 1) SÉLECTEUR D'ANNÉE GLOBAL — par défaut RIEN n'est affiché
+    # TABLEAU DE BORD GLOBAL (toutes années confondues) — TOUJOURS VISIBLE
+    # ============================================================
+    render_global_dashboard(df_full)
+    st.caption(
+        f"📊 **Lecture intégrale du Google Sheet** : "
+        f"{len(df_full)} opération(s) chargée(s) "
+        f"sur {len(set(int(y) for y in df_full['annee'].unique() if int(y) > 0))} année(s)."
+    )
+
+    # ============================================================
+    # 1) SÉLECTEUR D'ANNÉE — par défaut RIEN n'est affiché en détail
     # ============================================================
     available_years = sorted(
         {int(y) for y in df_full["annee"].unique() if int(y) > 0},
