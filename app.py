@@ -209,10 +209,6 @@ def _normalize_df(df):
     # (pour que les opérations apparaissent dans la vue active du mois).
     df["annee"] = parsed.dt.year.where(parsed.notna(), current_year).astype(int)
 
-    # Date affichée : "Date non spécifiée" si non parsable
-    df["date_affichage"] = df["date"]
-    df.loc[parsed.isna(), "date_affichage"] = "Date non spécifiée"
-
     # Date triable (pour reçus PDF et tris) : 1er du mois si manquante
     def _fallback_date(row):
         m_idx = MONTH_INDEX.get(row["mois"], 1)
@@ -220,6 +216,9 @@ def _normalize_df(df):
 
     fallback = df.apply(_fallback_date, axis=1)
     df["date_triable"] = parsed.where(parsed.notna(), fallback)
+
+    # Date affichée : la vraie date si présente, sinon le 1er du mois (ex. 01/03/2026)
+    df["date_affichage"] = df["date_triable"].dt.strftime("%d/%m/%Y")
     return df
 
 
@@ -854,6 +853,26 @@ def main():
                 st.info(f"Aucune donnée pour {mois} {current_year}.")
             else:
                 render_rows_with_actions(df, mois, key_prefix=f"cur_{mois}_{current_year}")
+
+                # --- Rapport mensuel (mois courant) ---
+                cur_rep_key = f"cur_rep_bytes_{mois}_{current_year}"
+                if st.button(
+                    f"📊 Imprimer le rapport de {mois} {current_year}",
+                    key=f"cur_rep_{mois}_{current_year}",
+                ):
+                    st.session_state[cur_rep_key] = (
+                        build_annual_report_pdf(df, mois, current_year),
+                        f"rapport_{mois}_{current_year}.pdf",
+                    )
+                if cur_rep_key in st.session_state:
+                    crb, crf = st.session_state[cur_rep_key]
+                    st.download_button(
+                        "⬇️ Télécharger le rapport du mois",
+                        data=crb,
+                        file_name=crf,
+                        mime="application/pdf",
+                        key=f"cur_dlrep_{mois}_{current_year}",
+                    )
 
             # --- Archives des années précédentes ---
             st.divider()
