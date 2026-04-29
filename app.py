@@ -224,9 +224,12 @@ def _normalize_df(df):
     return df
 
 
-# --- CHARGEMENT BLINDÉ DE TOUTES LES DONNÉES ---
+# --- CHARGEMENT BLINDÉ DE TOUTES LES DONNÉES (mis en cache) ---
+@st.cache_data(show_spinner="Chargement des données…")
 def load_all_data():
-    """Lit absolument TOUTES les lignes du Google Sheet."""
+    """Lit absolument TOUTES les lignes du Google Sheet.
+    Mis en cache : ne ré-interroge le Sheet que si le cache est invalidé
+    (bouton 'Actualiser' ou après tout enregistrement / suppression / édition)."""
     sheet = get_sheet()
     if sheet is None:
         return pd.DataFrame(columns=COLS + ["annee"])
@@ -252,20 +255,31 @@ def load_all_data():
 
 
 def _apply_strict_filter(df):
-    """Nettoyage automatique en mémoire : ne garde QUE les lignes essentielles.
-    On exclut toute ligne sans nom OU sans aucun montant (entrée=0 ET sortie=0).
-    Cela évite l'affichage d'années / mois fantômes provenant de cellules
-    vides ou de bordures dans le Google Sheet."""
+    """Nettoyage automatique en mémoire : ne supprime QUE les lignes totalement
+    vides (aucun nom ET aucune désignation ET aucun montant).
+    On garde donc toute ligne ayant au moins un montant — même si la date ou
+    le nom sont incomplets — pour ne perdre aucune donnée du Google Sheet."""
     if df is None or df.empty:
         return df
     nom_ok = df["nom"].astype(str).str.strip().ne("")
+    des_ok = df["designation"].astype(str).str.strip().ne("")
     montant_ok = (df["entree"].fillna(0) > 0) | (df["sortie"].fillna(0) > 0)
-    return df[nom_ok & montant_ok].reset_index(drop=True)
+    return df[nom_ok | des_ok | montant_ok].reset_index(drop=True)
 
 
 def load_data(mois_selectionne):
     df = load_all_data()
     return df[df["mois"] == mois_selectionne].reset_index(drop=True)
+
+
+# --- INVALIDATION DU CACHE ---
+def _invalidate_cache():
+    """Vide le cache des données pour forcer un rechargement frais
+    depuis le Google Sheet au prochain appel de load_all_data()."""
+    try:
+        load_all_data.clear()
+    except Exception:
+        pass
 
 
 # --- SUPPRESSION PAR ID UNIQUE ---
@@ -285,6 +299,7 @@ def delete_item(item_id):
             continue
         if len(row) > 0 and str(row[0]).strip() == target:
             sheet.delete_rows(i + 1)
+            _invalidate_cache()
             return True
     return False
 
@@ -318,6 +333,7 @@ def update_item(item_id, updates):
                     f"A{sheet_row}:{chr(ord('A') + len(COLS) - 1)}{sheet_row}",
                     [new_row],
                 )
+                _invalidate_cache()
                 return True
             except Exception as e:
                 st.error(f"Erreur mise à jour : {e}")
@@ -362,6 +378,8 @@ def cleanup_empty_rows():
             deleted += 1
         except Exception:
             pass
+    if deleted > 0:
+        _invalidate_cache()
     return deleted
 
 
@@ -405,6 +423,8 @@ def delete_year(annee):
             deleted += 1
         except Exception:
             pass
+    if deleted > 0:
+        _invalidate_cache()
     return deleted
 
 
@@ -450,6 +470,8 @@ def cleanup_incomplete_rows():
             deleted += 1
         except Exception:
             pass
+    if deleted > 0:
+        _invalidate_cache()
     return deleted
 
 
@@ -749,10 +771,15 @@ def login_screen():
             st.error("Mot de passe incorrect.")
 
 
-def render_global_dashboard(df_full):
-    """Tableau de bord global : somme TOTALE de TOUT le fichier (tous mois, toutes années)."""
-    st.markdown("### Tableau de bord global")
-    st.caption("Cumul de toutes les opérations enregistrées dans le Google Sheet")
+def render_global_dashboard(df_full, annee=None):
+    """Tableau de bord global : cumul des opérations.
+    Si `annee` est fourni, n'affiche que les totaux de cette année."""
+    if annee is not None:
+        st.markdown(f"### Tableau de bord — Année {annee}")
+        st.caption(f"Cumul des opérations enregistrées en {annee}")
+    else:
+        st.markdown("### Tableau de bord global")
+        st.caption("Cumul de toutes les opérations enregistrées dans le Google Sheet")
 
     if df_full.empty:
         t_e = t_s = 0.0
@@ -765,7 +792,7 @@ def render_global_dashboard(df_full):
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Entrées", fmt_fcfa(t_e))
     c2.metric("Total Sorties", fmt_fcfa(t_s))
-    c3.metric("Solde Global", fmt_fcfa(t_e - t_s))
+    c3.metric("Solde", fmt_fcfa(t_e - t_s))
     c4.metric("Opérations", f"{nb}")
 
     st.divider()
@@ -787,83 +814,154 @@ def main():
         st.title(SCHOOL_NAME)
         st.caption("Gestion de la caisse scolaire")
 
-    # --- Charge TOUTES les données une seule fois ---
+    # --- Charge TOUTES les données depuis le cache (Sheet appelé seulement si invalidé) ---
     df_full = load_all_data()
 
-    # --- Tableau de bord global EN HAUT, avant les onglets ---
-    render_global_dashboard(df_full)
+    current_year = date.today().year
 
-    # --- Outils d'administration (nettoyage) ---
-    with st.expander("⚙️ Outils d'administration"):
-        st.write(
-            "**Synchronisation stricte** : recharge les données directement depuis "
-            "le Google Sheet et supprime tout résidu d'affichage."
+    # ============================================================
+    # 1) SÉLECTEUR D'ANNÉE GLOBAL — par défaut RIEN n'est affiché
+    # ============================================================
+    available_years = sorted(
+        {int(y) for y in df_full["annee"].unique() if int(y) > 0},
+        reverse=True,
+    )
+    if current_year not in available_years:
+        available_years = [current_year] + available_years
+
+    sel_col1, sel_col2 = st.columns([3, 1])
+    with sel_col1:
+        sel_year = st.selectbox(
+            "📅 Choisir une année à afficher",
+            options=available_years,
+            index=None,
+            placeholder="-- Sélectionnez une année --",
+            key="global_year_select",
         )
-        if st.button("🔄 Forcer la synchronisation avec le Sheet", type="secondary"):
-            try:
-                st.cache_data.clear()
-            except Exception:
-                pass
-            try:
-                st.cache_resource.clear()
-            except Exception:
-                pass
+    with sel_col2:
+        st.write("")
+        st.write("")
+        if st.button("🔄 Actualiser", type="secondary", help="Recharger depuis le Google Sheet"):
+            _invalidate_cache()
             for k in list(st.session_state.keys()):
                 if (
                     k.startswith("row_pdf_")
                     or k.startswith("pdf_bytes_")
                     or k.startswith("arc_pdf")
                     or k.startswith("rep_bytes_")
+                    or k.startswith("cur_rep_bytes_")
                 ):
                     del st.session_state[k]
-            st.success("Synchronisation forcée. Données rechargées depuis le Sheet.")
-            time.sleep(0.6)
+            st.toast("Données rechargées depuis le Google Sheet.", icon="🔄")
             st.rerun()
 
-        st.markdown("---")
-        st.write(
-            "Le nettoyage supprime définitivement les lignes considérées comme vides "
-            "(sans nom, sans désignation et avec des montants à zéro)."
+    if sel_year is None:
+        st.info(
+            "👆 Sélectionnez une année dans le menu ci-dessus pour afficher les opérations.\n\n"
+            "Aucune donnée n'est chargée tant qu'une année n'est pas choisie."
         )
-        if st.button("🧹 Nettoyer les lignes vides / tests", type="secondary"):
+        return
+
+    # ============================================================
+    # 2) DONNÉES FILTRÉES SUR L'ANNÉE SÉLECTIONNÉE
+    # ============================================================
+    df_year = df_full[df_full["annee"] == sel_year].reset_index(drop=True)
+
+    # Tableau de bord global de l'année sélectionnée
+    render_global_dashboard(df_year, annee=sel_year)
+
+    # --- Actions sur l'année entière (impression + suppression) ---
+    act_c1, act_c2 = st.columns(2)
+
+    with act_c1:
+        year_rep_key = f"year_rep_bytes_{sel_year}"
+        if st.button(
+            f"📊 Imprimer toute l'année {sel_year}",
+            key=f"year_rep_btn_{sel_year}",
+            use_container_width=True,
+        ):
+            st.session_state[year_rep_key] = (
+                build_annual_report_pdf(df_year, "Année complète", sel_year),
+                f"rapport_annuel_{sel_year}.pdf",
+            )
+        if year_rep_key in st.session_state:
+            yrb, yrf = st.session_state[year_rep_key]
+            st.download_button(
+                "⬇️ Télécharger le rapport annuel",
+                data=yrb,
+                file_name=yrf,
+                mime="application/pdf",
+                key=f"year_dlrep_{sel_year}",
+                use_container_width=True,
+            )
+
+    with act_c2:
+        with st.expander(f"🗑️ Supprimer toute l'année {sel_year}"):
+            st.warning(
+                f"Cette action supprime **toutes les opérations de {sel_year}** "
+                "(tous mois confondus) du Google Sheet. Action irréversible."
+            )
+            confirm_year = st.checkbox(
+                f"Je confirme la suppression complète de l'année {sel_year}",
+                key=f"del_year_confirm_{sel_year}",
+            )
+            if st.button(
+                f"Supprimer définitivement {sel_year}",
+                key=f"del_year_btn_{sel_year}",
+                type="primary",
+                disabled=not confirm_year,
+            ):
+                n = delete_year(sel_year)
+                if n > 0:
+                    st.success(f"{n} ligne(s) de {sel_year} supprimée(s).")
+                    st.session_state["global_year_select"] = None
+                    time.sleep(0.8)
+                    st.rerun()
+                else:
+                    st.info(f"Aucune ligne {sel_year} trouvée.")
+
+    # --- Outils d'administration (repliés par défaut) ---
+    with st.expander("⚙️ Outils d'administration"):
+        st.write("Nettoyage des lignes vides ou test (sans nom, sans désignation, montants à 0).")
+        if st.button("🧹 Nettoyer les lignes vides", key="clean_empty_btn"):
             n = cleanup_empty_rows()
             if n > 0:
                 st.success(f"{n} ligne(s) supprimée(s).")
             else:
                 st.info("Aucune ligne vide à supprimer.")
-            time.sleep(0.8)
+            time.sleep(0.6)
             st.rerun()
 
         st.markdown("---")
-        st.write(
-            "**Nettoyage forcé** : supprime aussi toutes les lignes incomplètes "
-            "(pas de nom OU pas de montant). À utiliser avec précaution."
-        )
+        st.write("**Nettoyage forcé** : supprime aussi les lignes incomplètes (pas de nom OU pas de montant).")
         force_confirm = st.checkbox(
-            "Je confirme vouloir lancer le nettoyage forcé",
+            "Je confirme le nettoyage forcé",
             key="force_cleanup_confirm",
         )
         if st.button(
-            "🔥 Nettoyage Forcé (lignes incomplètes)",
+            "🔥 Nettoyage forcé",
             type="primary",
             disabled=not force_confirm,
+            key="force_clean_btn",
         ):
             n = cleanup_incomplete_rows()
             if n > 0:
                 st.success(f"{n} ligne(s) incomplète(s) supprimée(s).")
             else:
                 st.info("Aucune ligne incomplète à supprimer.")
-            time.sleep(0.8)
+            time.sleep(0.6)
             st.rerun()
 
-    current_year = date.today().year
+    # ============================================================
+    # 3) ONGLETS MENSUELS (Septembre → Août) FILTRÉS SUR L'ANNÉE
+    # ============================================================
+    is_current_year = (sel_year == current_year)
     tabs = st.tabs(MONTHS)
     for i, mois in enumerate(MONTHS):
         with tabs[i]:
-            df_all = df_full[df_full["mois"] == mois].reset_index(drop=True)
-            df = df_all[df_all["annee"] == current_year].reset_index(drop=True)
+            df = df_year[df_year["mois"] == mois].reset_index(drop=True)
 
-            st.markdown(f"**Année en cours : {current_year}**")
+            st.markdown(f"**{mois} {sel_year}**")
             t_e = float(df["entree"].sum()) if not df.empty else 0.0
             t_s = float(df["sortie"].sum()) if not df.empty else 0.0
             c1, c2, c3 = st.columns(3)
@@ -871,154 +969,65 @@ def main():
             c2.metric("Sorties", fmt_fcfa(t_s))
             c3.metric("Solde", fmt_fcfa(t_e - t_s))
 
-            with st.expander("➕ Nouvelle opération"):
-                with st.form(f"f_{mois}", clear_on_submit=True):
-                    d = st.date_input("Date", value=date.today())
-                    nom = st.text_input("Nom de l'élève")
-                    cl = st.text_input("Classe")
-                    des = st.text_input("Désignation")
-                    ent = st.number_input("Entrée (FCFA)", min_value=0.0, step=500.0)
-                    sor = st.number_input("Sortie (FCFA)", min_value=0.0, step=500.0)
-                    if st.form_submit_button("Enregistrer", type="primary"):
-                        sheet = get_sheet()
-                        if sheet is not None:
-                            new_id = str(int(time.time()))
-                            try:
-                                sheet.append_row([
-                                    new_id, mois, d.isoformat(), des, nom, cl,
-                                    str(ent), str(sor),
-                                ])
-                                st.success("Opération enregistrée.")
-                                time.sleep(0.8)
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Erreur enregistrement : {e}")
-
-            if df.empty:
-                st.info(f"Aucune donnée pour {mois} {current_year}.")
+            # Formulaire d'ajout : seulement pour l'année en cours
+            if is_current_year:
+                with st.expander("➕ Nouvelle opération"):
+                    with st.form(f"f_{mois}_{sel_year}", clear_on_submit=True):
+                        d = st.date_input("Date", value=date.today())
+                        nom = st.text_input("Nom de l'élève")
+                        cl = st.text_input("Classe")
+                        des = st.text_input("Désignation")
+                        ent = st.number_input("Entrée (FCFA)", min_value=0.0, step=500.0)
+                        sor = st.number_input("Sortie (FCFA)", min_value=0.0, step=500.0)
+                        if st.form_submit_button("Enregistrer", type="primary"):
+                            sheet = get_sheet()
+                            if sheet is not None:
+                                new_id = str(int(time.time()))
+                                try:
+                                    sheet.append_row([
+                                        new_id, mois, d.isoformat(), des, nom, cl,
+                                        str(ent), str(sor),
+                                    ])
+                                    _invalidate_cache()
+                                    st.success("Opération enregistrée.")
+                                    time.sleep(0.6)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Erreur enregistrement : {e}")
             else:
-                render_rows_with_actions(df, mois, key_prefix=f"cur_{mois}_{current_year}")
+                st.caption(
+                    f"📁 Année archivée — l'ajout de nouvelles opérations n'est possible "
+                    f"que pour l'année en cours ({current_year})."
+                )
 
-                # --- Rapport mensuel (mois courant) ---
-                cur_rep_key = f"cur_rep_bytes_{mois}_{current_year}"
+            # Tableau des opérations + boutons par ligne (Modifier / Supprimer / Reçu PDF)
+            if df.empty:
+                st.info(f"Aucune opération pour {mois} {sel_year}.")
+            else:
+                render_rows_with_actions(
+                    df, mois,
+                    key_prefix=f"m_{mois}_{sel_year}",
+                )
+
+                # Bouton "Imprimer le mois"
+                month_rep_key = f"month_rep_bytes_{mois}_{sel_year}"
                 if st.button(
-                    f"📊 Imprimer le rapport de {mois} {current_year}",
-                    key=f"cur_rep_{mois}_{current_year}",
+                    f"📊 Imprimer le mois ({mois} {sel_year})",
+                    key=f"month_rep_btn_{mois}_{sel_year}",
                 ):
-                    st.session_state[cur_rep_key] = (
-                        build_annual_report_pdf(df, mois, current_year),
-                        f"rapport_{mois}_{current_year}.pdf",
+                    st.session_state[month_rep_key] = (
+                        build_annual_report_pdf(df, mois, sel_year),
+                        f"rapport_{mois}_{sel_year}.pdf",
                     )
-                if cur_rep_key in st.session_state:
-                    crb, crf = st.session_state[cur_rep_key]
+                if month_rep_key in st.session_state:
+                    mrb, mrf = st.session_state[month_rep_key]
                     st.download_button(
                         "⬇️ Télécharger le rapport du mois",
-                        data=crb,
-                        file_name=crf,
+                        data=mrb,
+                        file_name=mrf,
                         mime="application/pdf",
-                        key=f"cur_dlrep_{mois}_{current_year}",
+                        key=f"month_dlrep_{mois}_{sel_year}",
                     )
-
-            # --- Archives des années précédentes ---
-            st.divider()
-            archive_years = sorted(
-                [int(y) for y in df_all["annee"].unique() if int(y) > 0 and int(y) != current_year],
-                reverse=True,
-            )
-            with st.expander("🗂️ Archives des années précédentes"):
-                if not archive_years:
-                    st.info("Aucune archive disponible pour ce mois.")
-                else:
-                    st.write(
-                        "Cliquez sur une année pour afficher les opérations archivées. "
-                        "Aucune donnée n'est affichée par défaut."
-                    )
-
-                    sel_year_state_key = f"sel_arc_year_{mois}"
-                    btn_cols = st.columns(min(len(archive_years), 6))
-                    for j, y in enumerate(archive_years):
-                        if btn_cols[j % len(btn_cols)].button(
-                            f"📅 {y}",
-                            key=f"arc_year_btn_{mois}_{y}",
-                        ):
-                            st.session_state[sel_year_state_key] = y
-
-                    if btn_cols[0].button(
-                        "✖ Masquer",
-                        key=f"arc_year_hide_{mois}",
-                    ):
-                        st.session_state.pop(sel_year_state_key, None)
-
-                    sel_year = st.session_state.get(sel_year_state_key)
-
-                    if sel_year is None:
-                        st.info("➡️ Sélectionnez une année ci-dessus pour afficher ses opérations.")
-                    else:
-                        df_archive = df_all[df_all["annee"] == sel_year].copy().reset_index(drop=True)
-
-                        st.markdown(f"### 📅 Année {sel_year} — {mois}")
-
-                        a_e = float(df_archive["entree"].sum())
-                        a_s = float(df_archive["sortie"].sum())
-                        ac1, ac2, ac3 = st.columns(3)
-                        ac1.metric("Entrées", fmt_fcfa(a_e))
-                        ac2.metric("Sorties", fmt_fcfa(a_s))
-                        ac3.metric("Solde", fmt_fcfa(a_e - a_s))
-
-                        if df_archive.empty:
-                            st.info(f"Aucune opération archivée pour {mois} {sel_year}.")
-                        else:
-                            render_rows_with_actions(
-                                df_archive, mois,
-                                key_prefix=f"arc_{mois}_{sel_year}",
-                            )
-
-                        # Rapport annuel du mois
-                        rep_key = f"rep_bytes_{mois}_{sel_year}"
-                        if st.button(
-                            f"📊 Imprimer l'année {sel_year} ({mois})",
-                            key=f"rep_{mois}_{sel_year}",
-                        ):
-                            st.session_state[rep_key] = (
-                                build_annual_report_pdf(df_archive, mois, sel_year),
-                                f"rapport_{mois}_{sel_year}.pdf",
-                            )
-                        if rep_key in st.session_state:
-                            rb, rf = st.session_state[rep_key]
-                            st.download_button(
-                                "⬇️ Télécharger le rapport",
-                                data=rb,
-                                file_name=rf,
-                                mime="application/pdf",
-                                key=f"dlrep_{mois}_{sel_year}",
-                            )
-
-                        # --- Suppression de toute l'année ---
-                        st.markdown("---")
-                        st.markdown(f"#### ⚠️ Suppression totale de l'année {sel_year}")
-                        st.write(
-                            f"Cette action supprime **toutes les lignes de {sel_year}** "
-                            "du Google Sheet, tous mois confondus. Action irréversible."
-                        )
-                        confirm_year_key = f"del_year_confirm_{mois}_{sel_year}"
-                        confirm_year = st.checkbox(
-                            f"Je confirme vouloir supprimer définitivement toutes les données de {sel_year}",
-                            key=confirm_year_key,
-                        )
-                        if st.button(
-                            f"🗑️ Supprimer toute l'année {sel_year}",
-                            key=f"del_year_btn_{mois}_{sel_year}",
-                            type="primary",
-                            disabled=not confirm_year,
-                        ):
-                            n = delete_year(sel_year)
-                            if n > 0:
-                                st.success(f"{n} ligne(s) de l'année {sel_year} supprimée(s) du Sheet.")
-                                st.session_state.pop(sel_year_state_key, None)
-                                time.sleep(0.8)
-                                st.rerun()
-                            else:
-                                st.info(f"Aucune ligne {sel_year} trouvée à supprimer.")
 
 
 
