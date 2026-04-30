@@ -49,11 +49,20 @@ MONTH_INDEX = {
 # Mots-clés indiquant des lignes de résumé Excel à ignorer (Fix 2)
 SUMMARY_KEYWORDS = re.compile(r"\b(TOTAL|TOTAUX|SOLDE|REPORT|REPORTS)\b", re.IGNORECASE)
 
-# Date par défaut pour les lignes sans date (Fix 3 - Récupération Mars 2022)
+# Date par défaut pour les lignes sans date (Fix 5 - Récupération Mars 2022)
 DEFAULT_DATE_YEAR = 2022
 DEFAULT_DATE_MONTH = 3
 DEFAULT_DATE_DAY = 1
 DEFAULT_MONTH_NAME = "Mars"
+
+# Toute date strictement antérieure est considérée aberrante (ex : 1900, 202)
+# et déclenche la correction intelligente par contexte (Fix 1).
+DATE_MIN_VALID = pd.Timestamp(year=2020, month=1, day=1)
+
+# Totaux attendus issus de la ligne rouge de l'Excel client (Fix 2).
+EXPECTED_ENTREES = 66_197_700
+EXPECTED_SORTIES = 66_096_315
+EXPECTED_SOLDE = EXPECTED_ENTREES - EXPECTED_SORTIES  # 101 385
 
 
 # --- CHARGEMENT SÉCURISÉ DES SECRETS ---
@@ -193,10 +202,85 @@ def _to_number(val):
         return 0.0
 
 
+def _intelligent_date_repair(df):
+    """Fix 1 : Correction intelligente des dates.
+
+    Une date est dite « aberrante » si :
+      - elle est vide, ou
+      - elle ne se parse pas, ou
+      - elle est antérieure à 2020 (ex : '1900', '202' tapés à la place de '2022').
+
+    Pour chaque ligne aberrante, on regarde la dernière date VALIDE au-dessus
+    et la première date VALIDE en-dessous (dans l'ordre du Sheet) :
+      - si les deux voisines partagent le même (année, mois) → on attribue
+        le 01 de ce mois (ex : encadrée par deux opérations de Septembre 2022
+        → '01/09/2022').
+      - sinon, on prend le 01 du mois de la voisine la plus proche au-dessus
+        (continuité chronologique avec la dernière opération connue).
+      - si aucune voisine n'est valide → fallback Mars 2022 (Fix 5).
+
+    Retourne la série pandas des dates réparées + le nombre de réparations.
+    """
+    raw_dates = df["date"].astype(str).str.strip()
+
+    parsed = pd.to_datetime(raw_dates, errors="coerce", dayfirst=True)
+    mask_unparsed = parsed.isna() & raw_dates.ne("")
+    if mask_unparsed.any():
+        parsed_iso = pd.to_datetime(raw_dates[mask_unparsed], errors="coerce")
+        parsed.loc[mask_unparsed] = parsed_iso
+
+    is_valid = parsed.notna() & (parsed >= DATE_MIN_VALID)
+
+    fallback_default = pd.Timestamp(
+        DEFAULT_DATE_YEAR, DEFAULT_DATE_MONTH, DEFAULT_DATE_DAY
+    )
+
+    repaired = parsed.where(is_valid)
+    nb_repaired = 0
+
+    parsed_list = parsed.tolist()
+    valid_list = is_valid.tolist()
+    n = len(parsed_list)
+
+    for pos in range(n):
+        if valid_list[pos]:
+            continue
+
+        prev_valid = None
+        for j in range(pos - 1, -1, -1):
+            if valid_list[j]:
+                prev_valid = parsed_list[j]
+                break
+
+        next_valid = None
+        for j in range(pos + 1, n):
+            if valid_list[j]:
+                next_valid = parsed_list[j]
+                break
+
+        if prev_valid is not None and next_valid is not None:
+            if (prev_valid.year == next_valid.year
+                    and prev_valid.month == next_valid.month):
+                chosen = pd.Timestamp(prev_valid.year, prev_valid.month, 1)
+            else:
+                chosen = pd.Timestamp(prev_valid.year, prev_valid.month, 1)
+        elif prev_valid is not None:
+            chosen = pd.Timestamp(prev_valid.year, prev_valid.month, 1)
+        elif next_valid is not None:
+            chosen = pd.Timestamp(next_valid.year, next_valid.month, 1)
+        else:
+            chosen = fallback_default
+
+        repaired.iloc[pos] = chosen
+        nb_repaired += 1
+
+    return repaired, nb_repaired
+
+
 def _normalize_df(df):
-    """Force types corrects sur toutes les colonnes.
-    Fix 3 : si la date manque, on utilise '01/03/2022' par défaut
-    et on force le mois à 'Mars' si la colonne mois est vide.
+    """Force les types corrects sur toutes les colonnes et applique
+    la correction intelligente des dates (Fix 1) ainsi que la
+    récupération des lignes Mars 2022 sans date (Fix 5).
     """
     for c in COLS:
         if c not in df.columns:
@@ -210,41 +294,26 @@ def _normalize_df(df):
     for col in ["id", "mois", "date", "designation", "nom", "classe"]:
         df[col] = df[col].astype(str).fillna("").str.strip()
 
-    # Parsing très robuste : européen d'abord, puis ISO/US pour le reste
-    raw_dates = df["date"].astype(str).str.strip()
-    parsed = pd.to_datetime(raw_dates, errors="coerce", dayfirst=True)
-    mask_unparsed = parsed.isna() & raw_dates.ne("")
-    if mask_unparsed.any():
-        parsed_iso = pd.to_datetime(raw_dates[mask_unparsed], errors="coerce")
-        parsed.loc[mask_unparsed] = parsed_iso
+    # Fix 1 + Fix 5 : Correction intelligente des dates aberrantes / manquantes
+    repaired, nb_repaired = _intelligent_date_repair(df)
+    df.attrs["nb_dates_repaired"] = int(nb_repaired)
 
-    # Fix 3 : pour toute ligne sans date, on défaut sur 01/03/2022 (Mars 2022)
-    fallback_date = pd.Timestamp(
-        year=DEFAULT_DATE_YEAR, month=DEFAULT_DATE_MONTH, day=DEFAULT_DATE_DAY
+    df["date_triable"] = repaired
+    df["annee"] = repaired.dt.year.astype(int)
+    df["date_affichage"] = repaired.dt.strftime("%d/%m/%Y")
+
+    # Aligne la colonne « mois » sur la date réparée si elle est vide
+    # ou si elle ne correspond pas à un mois connu.
+    mois_vide = (
+        df["mois"].str.strip().eq("")
+        | df["mois"].str.strip().str.lower().eq("nan")
+        | (~df["mois"].isin(MONTHS))
     )
-
-    # Année : utilise la vraie année si dispo, sinon 2022 par défaut
-    df["annee"] = parsed.dt.year.where(parsed.notna(), DEFAULT_DATE_YEAR).astype(int)
-
-    # Date triable (pour les tris et les reçus PDF) : 01/03/2022 si manquante
-    df["date_triable"] = parsed.where(parsed.notna(), fallback_date)
-
-    # Date affichée : la vraie date (JJ/MM/AAAA) ou la date par défaut
-    df["date_affichage"] = parsed.dt.strftime("%d/%m/%Y")
-    fallback_str = fallback_date.strftime("%d/%m/%Y")
-    df.loc[parsed.isna(), "date_affichage"] = fallback_str
-
-    # Fix 3 : si le mois est vide ET la date est manquante,
-    # on force "Mars" pour que la ligne apparaisse dans l'onglet Mars
-    mois_vide = df["mois"].str.strip().eq("") | df["mois"].str.strip().str.lower().eq("nan")
-    date_manquante = parsed.isna()
-    df.loc[mois_vide & date_manquante, "mois"] = DEFAULT_MONTH_NAME
-
-    # Si le mois est vide mais qu'on a une date, on déduit le mois depuis la date
-    has_date_no_month = mois_vide & parsed.notna()
-    if has_date_no_month.any():
+    if mois_vide.any():
         month_num_to_name = {v: k for k, v in MONTH_INDEX.items()}
-        df.loc[has_date_no_month, "mois"] = parsed[has_date_no_month].dt.month.map(month_num_to_name)
+        df.loc[mois_vide, "mois"] = (
+            repaired[mois_vide].dt.month.map(month_num_to_name)
+        )
 
     return df
 
@@ -265,24 +334,54 @@ def _is_summary_row(designation, nom):
 
 
 def _apply_strict_filter(df):
-    """Filtre les lignes :
-    - Fix 2 : ignore toute ligne 'TOTAL', 'TOTAUX', 'SOLDE', 'REPORT' dans Désignation/Nom
-    - Garde les lignes ayant AU MOINS un nom OU un montant (supprime les fantômes vides)
+    """Filtre les lignes (Fix 2) :
+      - ignore toute ligne 'TOTAL', 'TOTAUX', 'SOLDE', 'REPORT' dans Désignation/Nom
+      - garde les lignes ayant au moins un nom OU un montant
+      - **déduplique** les lignes strictement identiques (même date, même nom,
+        même classe, même désignation, mêmes montants) — un doublon dans
+        l'Excel d'origine ferait gonfler les totaux artificiellement.
     """
     if df is None or df.empty:
         return df
+
+    # Mémorise le nombre de lignes brutes pour le diagnostic
+    nb_raw = len(df)
 
     # Fix 2 : éliminer les lignes de résumé Excel (TOTAL, SOLDE, REPORT)
     is_summary = df.apply(
         lambda r: _is_summary_row(r.get("designation", ""), r.get("nom", "")),
         axis=1,
     )
+    nb_summary = int(is_summary.sum())
     df = df[~is_summary]
 
     # Garde les lignes ayant un nom ou un montant
     nom_ok = df["nom"].astype(str).str.strip().ne("")
     montant_ok = (df["entree"].fillna(0) > 0) | (df["sortie"].fillna(0) > 0)
-    return df[nom_ok | montant_ok].reset_index(drop=True)
+    keep_mask = nom_ok | montant_ok
+    nb_empty = int((~keep_mask).sum())
+    df = df[keep_mask]
+
+    # Déduplication exacte (Fix 2)
+    dedup_key = (
+        df["date_affichage"].astype(str) + "|"
+        + df["nom"].astype(str).str.strip().str.lower() + "|"
+        + df["classe"].astype(str).str.strip().str.lower() + "|"
+        + df["designation"].astype(str).str.strip().str.lower() + "|"
+        + df["entree"].astype(float).map(lambda x: f"{x:.2f}") + "|"
+        + df["sortie"].astype(float).map(lambda x: f"{x:.2f}")
+    )
+    dup_mask = dedup_key.duplicated(keep="first")
+    nb_duplicates = int(dup_mask.sum())
+    df = df.loc[~dup_mask].reset_index(drop=True)
+
+    # Diagnostic exposé via df.attrs (consulté par le tableau de bord)
+    df.attrs["nb_raw_rows"] = nb_raw
+    df.attrs["nb_summary_rows"] = nb_summary
+    df.attrs["nb_empty_rows"] = nb_empty
+    df.attrs["nb_duplicates"] = nb_duplicates
+
+    return df
 
 
 # --- CHARGEMENT BLINDÉ DE TOUTES LES DONNÉES (Fix 4 : get_all_values) ---
@@ -346,8 +445,20 @@ def load_all_data():
     if df is None or df.empty:
         return pd.DataFrame(columns=COLS + ["annee"])
 
+    nb_sheet_rows = len(df)
     df = _normalize_df(df)
+    nb_dates_repaired = int(df.attrs.get("nb_dates_repaired", 0))
     df = _apply_strict_filter(df)
+
+    # Tri chronologique inversé : le plus récent en premier (Fix 3)
+    if "date_triable" in df.columns and not df.empty:
+        df = df.sort_values(
+            "date_triable", ascending=False, kind="mergesort"
+        ).reset_index(drop=True)
+
+    # Diagnostic global (consulté par le tableau de bord)
+    df.attrs["nb_sheet_rows"] = nb_sheet_rows
+    df.attrs["nb_dates_repaired"] = nb_dates_repaired
     return df
 
 
@@ -752,11 +863,21 @@ def fmt_fcfa(n):
 
 
 def render_rows_with_actions(df, mois, key_prefix):
-    """Fix 5 : Affiche chaque ligne avec ses propres boutons : Modifier / Supprimer / Reçu PDF.
-    Fonctionne dans TOUS les onglets (mois en cours et archives).
-    Toute suppression cible la vraie ligne du Google Sheet via son ID."""
+    """Fix 6 : Affiche chaque ligne avec ses propres boutons :
+    Modifier / Supprimer / Reçu PDF. Fonctionne dans TOUS les onglets
+    (mois en cours et archives). Toute suppression cible la vraie ligne
+    du Google Sheet via son ID.
+
+    Fix 3 : les lignes sont triées du plus récent au plus ancien.
+    """
     if df is None or df.empty:
         return
+
+    # Fix 3 : tri chronologique inversé (du plus récent au plus ancien)
+    if "date_triable" in df.columns:
+        df = df.sort_values(
+            "date_triable", ascending=False, kind="mergesort"
+        ).reset_index(drop=True)
 
     headers = ["Date", "Nom", "Classe", "Désignation", "Entrée", "Sortie", "Actions"]
     col_widths = [1.2, 1.6, 1.0, 2.2, 1.0, 1.0, 1.6]
@@ -892,7 +1013,10 @@ def login_screen():
 
 def render_global_dashboard(df_full, annee=None):
     """Tableau de bord global : cumul des opérations.
-    Si `annee` est fourni, n'affiche que les totaux de cette année."""
+    Si `annee` est fourni, n'affiche que les totaux de cette année.
+    Si `annee` est None, affiche en plus la comparaison avec les
+    totaux Excel attendus (Fix 2 : ligne rouge du fichier client).
+    """
     if annee is not None:
         st.markdown(f"### Tableau de bord — Année {annee}")
         st.caption(f"Cumul des opérations enregistrées en {annee}")
@@ -913,6 +1037,63 @@ def render_global_dashboard(df_full, annee=None):
     c2.metric("Total Sorties", fmt_fcfa(t_s))
     c3.metric("Solde", fmt_fcfa(t_e - t_s))
     c4.metric("Opérations", f"{nb}")
+
+    # Fix 2 : comparaison avec les totaux Excel attendus (uniquement
+    # pour le tableau de bord global toutes années confondues).
+    if annee is None and not df_full.empty:
+        diff_e = t_e - EXPECTED_ENTREES
+        diff_s = t_s - EXPECTED_SORTIES
+        diff_solde = (t_e - t_s) - EXPECTED_SOLDE
+
+        if abs(diff_e) < 1 and abs(diff_s) < 1:
+            st.success(
+                f"Totaux conformes à l'Excel : "
+                f"Entrées {fmt_fcfa(EXPECTED_ENTREES)} · "
+                f"Sorties {fmt_fcfa(EXPECTED_SORTIES)} · "
+                f"Solde {fmt_fcfa(EXPECTED_SOLDE)}."
+            )
+        else:
+            with st.expander(
+                "Comparaison avec la ligne rouge de l'Excel",
+                expanded=True,
+            ):
+                e1, e2, e3 = st.columns(3)
+                e1.metric(
+                    "Entrées attendues",
+                    fmt_fcfa(EXPECTED_ENTREES),
+                    delta=f"{diff_e:+,.0f} FCFA".replace(",", " "),
+                    delta_color="inverse",
+                )
+                e2.metric(
+                    "Sorties attendues",
+                    fmt_fcfa(EXPECTED_SORTIES),
+                    delta=f"{diff_s:+,.0f} FCFA".replace(",", " "),
+                    delta_color="inverse",
+                )
+                e3.metric(
+                    "Solde attendu",
+                    fmt_fcfa(EXPECTED_SOLDE),
+                    delta=f"{diff_solde:+,.0f} FCFA".replace(",", " "),
+                    delta_color="inverse",
+                )
+                nb_raw = df_full.attrs.get("nb_sheet_rows", "?")
+                nb_summary = df_full.attrs.get("nb_summary_rows", "?")
+                nb_empty = df_full.attrs.get("nb_empty_rows", "?")
+                nb_dup = df_full.attrs.get("nb_duplicates", "?")
+                nb_repaired = df_full.attrs.get("nb_dates_repaired", "?")
+                st.caption(
+                    f"Lignes lues dans le Sheet : **{nb_raw}** · "
+                    f"lignes de résumé ignorées : **{nb_summary}** · "
+                    f"lignes vides ignorées : **{nb_empty}** · "
+                    f"doublons écartés : **{nb_dup}** · "
+                    f"dates aberrantes corrigées : **{nb_repaired}**."
+                )
+                if abs(diff_e) >= 1 or abs(diff_s) >= 1:
+                    st.info(
+                        "Si l'écart persiste, utilisez « Outils d'administration "
+                        "→ Nettoyer les lignes vides » pour purger d'éventuelles "
+                        "lignes fantômes restantes dans le Google Sheet."
+                    )
 
     st.divider()
 
@@ -991,10 +1172,17 @@ def main():
     # TABLEAU DE BORD GLOBAL (toutes années confondues)
     # ============================================================
     render_global_dashboard(df_full)
-    annees_count = len({int(y) for y in df_full["annee"].unique() if int(y) > 0}) if not df_full.empty else 0
+    annees_count = (
+        len({int(y) for y in df_full["annee"].unique() if int(y) > 0})
+        if not df_full.empty else 0
+    )
+    nb_sheet_rows = df_full.attrs.get("nb_sheet_rows", len(df_full))
     st.caption(
         f"**Lecture intégrale du Google Sheet** : "
-        f"{len(df_full)} opération(s) chargée(s) sur {annees_count} année(s)."
+        f"{nb_sheet_rows} ligne(s) brute(s) lue(s) · "
+        f"{len(df_full)} opération(s) valide(s) après nettoyage · "
+        f"{annees_count} année(s) couverte(s) · "
+        f"objectif Excel : 5934 lignes."
     )
 
     # ============================================================
