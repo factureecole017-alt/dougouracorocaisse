@@ -46,6 +46,15 @@ MONTH_INDEX = {
     "Juin": 6, "Juillet": 7, "Août": 8,
 }
 
+# Mots-clés indiquant des lignes de résumé Excel à ignorer (Fix 2)
+SUMMARY_KEYWORDS = re.compile(r"\b(TOTAL|TOTAUX|SOLDE|REPORT|REPORTS)\b", re.IGNORECASE)
+
+# Date par défaut pour les lignes sans date (Fix 3 - Récupération Mars 2022)
+DEFAULT_DATE_YEAR = 2022
+DEFAULT_DATE_MONTH = 3
+DEFAULT_DATE_DAY = 1
+DEFAULT_MONTH_NAME = "Mars"
+
 
 # --- CHARGEMENT SÉCURISÉ DES SECRETS ---
 REQUIRED_GCP_KEYS = {
@@ -58,7 +67,6 @@ def _coerce_to_dict(raw):
     """Transforme une valeur de secret (dict, AttrDict, ou string JSON) en dict Python pur."""
     if raw is None:
         return None
-    # st.secrets renvoie souvent un AttrDict (pour les tables TOML)
     if hasattr(raw, "to_dict"):
         try:
             return dict(raw.to_dict())
@@ -66,39 +74,41 @@ def _coerce_to_dict(raw):
             pass
     if isinstance(raw, dict):
         return dict(raw)
-    # Sinon on suppose une string JSON
     text = str(raw).strip()
     if not text:
         return None
     try:
         return json.loads(text, strict=False)
     except json.JSONDecodeError:
-        # Tente de réparer les retours à la ligne bruts dans la private_key
         cleaned = text.replace("\r\n", "\\n").replace("\n", "\\n").replace("\t", "\\t")
         return json.loads(cleaned, strict=False)
 
 
 def _load_gcp_credentials():
     """Charge les identifiants Google de manière blindée.
-    Accepte deux formats :
-      - st.secrets["GCP_JSON"]  (string JSON ou env var)
-      - st.secrets["gcp_service_account"]  (table TOML / dict)
+    Garde la logique json.loads(st.secrets["GCP_JSON"]) pour éviter l'erreur 'keys'.
+    Accepte trois sources :
+      - st.secrets["GCP_JSON"]            (string JSON — priorité demandée)
+      - st.secrets["gcp_service_account"] (table TOML / dict)
+      - variable d'environnement GCP_JSON (string JSON)
     """
     candidates = []
 
-    # 1) gcp_service_account (table TOML ou JSON) — priorité
+    # 1) GCP_JSON dans les secrets Streamlit — PRIORITÉ (logique demandée)
+    try:
+        if "GCP_JSON" in st.secrets:
+            candidates.append(("GCP_JSON", st.secrets["GCP_JSON"]))
+    except Exception:
+        pass
+
+    # 2) gcp_service_account (table TOML) — fallback
     try:
         if "gcp_service_account" in st.secrets:
             candidates.append(("gcp_service_account", st.secrets["gcp_service_account"]))
     except Exception:
         pass
 
-    # 2) GCP_JSON (string JSON) — fallback
-    try:
-        if "GCP_JSON" in st.secrets:
-            candidates.append(("GCP_JSON", st.secrets["GCP_JSON"]))
-    except Exception:
-        pass
+    # 3) Variable d'environnement GCP_JSON — fallback final
     env_json = os.environ.get("GCP_JSON")
     if env_json:
         candidates.append(("env GCP_JSON", env_json))
@@ -157,7 +167,8 @@ def get_sheet():
 
 # --- CONVERSION NUMÉRIQUE BLINDÉE ---
 def _to_number(val):
-    """Convertit n'importe quelle valeur (string avec espaces, virgule, FCFA, etc.) en float."""
+    """Convertit n'importe quelle valeur (string avec espaces, virgule, FCFA, etc.) en float.
+    Fix 2 : nettoie tout texte (FCFA, espaces insécables, etc.)."""
     if val is None:
         return 0.0
     if isinstance(val, (int, float)):
@@ -168,11 +179,11 @@ def _to_number(val):
     s = str(val).strip()
     if not s:
         return 0.0
-    # supprime espaces normaux, espaces insécables et tout caractère non numérique sauf , . -
+    # supprime espaces normaux, espaces insécables, FCFA, et tout caractère non numérique sauf , . -
     s = s.replace("\xa0", "").replace(" ", "")
+    s = re.sub(r"(?i)fcfa", "", s)
     s = re.sub(r"[^\d,.\-]", "", s)
     s = s.replace(",", ".")
-    # si plusieurs points, ne garde que le dernier comme séparateur décimal
     if s.count(".") > 1:
         parts = s.split(".")
         s = "".join(parts[:-1]) + "." + parts[-1]
@@ -184,15 +195,14 @@ def _to_number(val):
 
 def _normalize_df(df):
     """Force types corrects sur toutes les colonnes.
-    Gère les dates manquantes : par défaut le 1er du mois (année courante)
-    et affiche 'Date non spécifiée' dans les tableaux.
+    Fix 3 : si la date manque, on utilise '01/03/2022' par défaut
+    et on force le mois à 'Mars' si la colonne mois est vide.
     """
     for c in COLS:
         if c not in df.columns:
             df[c] = ""
 
-    # 1) Pré-nettoyage texte (espaces, virgules, FCFA, etc.) via _to_number
-    # 2) Filet de sécurité final : pd.to_numeric(errors='coerce').fillna(0)
+    # Fix 2 : Nettoyage numérique blindé (FCFA, espaces, virgules)
     for col in NUM_COLS:
         cleaned = df[col].map(_to_number)
         df[col] = pd.to_numeric(cleaned, errors="coerce").fillna(0).astype(float)
@@ -200,9 +210,7 @@ def _normalize_df(df):
     for col in ["id", "mois", "date", "designation", "nom", "classe"]:
         df[col] = df[col].astype(str).fillna("").str.strip()
 
-    # Tentative de parsing de la date — TRÈS robuste :
-    # 1) format européen / français (jour d'abord : 05/12/2021)
-    # 2) format ISO ou US pour les valeurs restantes (2021-12-05, 12/5/2021)
+    # Parsing très robuste : européen d'abord, puis ISO/US pour le reste
     raw_dates = df["date"].astype(str).str.strip()
     parsed = pd.to_datetime(raw_dates, errors="coerce", dayfirst=True)
     mask_unparsed = parsed.isna() & raw_dates.ne("")
@@ -210,69 +218,130 @@ def _normalize_df(df):
         parsed_iso = pd.to_datetime(raw_dates[mask_unparsed], errors="coerce")
         parsed.loc[mask_unparsed] = parsed_iso
 
-    current_year = date.today().year
+    # Fix 3 : pour toute ligne sans date, on défaut sur 01/03/2022 (Mars 2022)
+    fallback_date = pd.Timestamp(
+        year=DEFAULT_DATE_YEAR, month=DEFAULT_DATE_MONTH, day=DEFAULT_DATE_DAY
+    )
 
-    # Année : si la date est invalide/vide, on rattache à l'année courante
-    # (pour que les opérations apparaissent dans la vue active du mois).
-    df["annee"] = parsed.dt.year.where(parsed.notna(), current_year).astype(int)
+    # Année : utilise la vraie année si dispo, sinon 2022 par défaut
+    df["annee"] = parsed.dt.year.where(parsed.notna(), DEFAULT_DATE_YEAR).astype(int)
 
-    # Date triable (pour reçus PDF et tris) : 1er du mois si manquante
-    def _fallback_date(row):
-        m_idx = MONTH_INDEX.get(row["mois"], 1)
-        return pd.Timestamp(year=current_year, month=m_idx, day=1)
+    # Date triable (pour les tris et les reçus PDF) : 01/03/2022 si manquante
+    df["date_triable"] = parsed.where(parsed.notna(), fallback_date)
 
-    fallback = df.apply(_fallback_date, axis=1)
-    df["date_triable"] = parsed.where(parsed.notna(), fallback)
-
-    # Date affichée : la vraie date (JJ/MM/AAAA) si présente,
-    # sinon "Date à compléter" — sans jamais bloquer l'affichage.
+    # Date affichée : la vraie date (JJ/MM/AAAA) ou la date par défaut
     df["date_affichage"] = parsed.dt.strftime("%d/%m/%Y")
-    df.loc[parsed.isna(), "date_affichage"] = "Date à compléter"
+    fallback_str = fallback_date.strftime("%d/%m/%Y")
+    df.loc[parsed.isna(), "date_affichage"] = fallback_str
+
+    # Fix 3 : si le mois est vide ET la date est manquante,
+    # on force "Mars" pour que la ligne apparaisse dans l'onglet Mars
+    mois_vide = df["mois"].str.strip().eq("") | df["mois"].str.strip().str.lower().eq("nan")
+    date_manquante = parsed.isna()
+    df.loc[mois_vide & date_manquante, "mois"] = DEFAULT_MONTH_NAME
+
+    # Si le mois est vide mais qu'on a une date, on déduit le mois depuis la date
+    has_date_no_month = mois_vide & parsed.notna()
+    if has_date_no_month.any():
+        month_num_to_name = {v: k for k, v in MONTH_INDEX.items()}
+        df.loc[has_date_no_month, "mois"] = parsed[has_date_no_month].dt.month.map(month_num_to_name)
+
     return df
 
 
-# --- CHARGEMENT BLINDÉ DE TOUTES LES DONNÉES (mis en cache) ---
+# --- FILTRAGE DES LIGNES DE RÉSUMÉ EXCEL (Fix 2) ---
+def _is_summary_row(designation, nom):
+    """Détecte les lignes contenant TOTAL / TOTAUX / SOLDE / REPORT
+    dans la colonne Désignation ou Nom (lignes Excel à ignorer pour les totaux)."""
+    for val in (designation, nom):
+        if val is None:
+            continue
+        s = str(val).strip()
+        if not s:
+            continue
+        if SUMMARY_KEYWORDS.search(s):
+            return True
+    return False
+
+
+def _apply_strict_filter(df):
+    """Filtre les lignes :
+    - Fix 2 : ignore toute ligne 'TOTAL', 'TOTAUX', 'SOLDE', 'REPORT' dans Désignation/Nom
+    - Garde les lignes ayant AU MOINS un nom OU un montant (supprime les fantômes vides)
+    """
+    if df is None or df.empty:
+        return df
+
+    # Fix 2 : éliminer les lignes de résumé Excel (TOTAL, SOLDE, REPORT)
+    is_summary = df.apply(
+        lambda r: _is_summary_row(r.get("designation", ""), r.get("nom", "")),
+        axis=1,
+    )
+    df = df[~is_summary]
+
+    # Garde les lignes ayant un nom ou un montant
+    nom_ok = df["nom"].astype(str).str.strip().ne("")
+    montant_ok = (df["entree"].fillna(0) > 0) | (df["sortie"].fillna(0) > 0)
+    return df[nom_ok | montant_ok].reset_index(drop=True)
+
+
+# --- CHARGEMENT BLINDÉ DE TOUTES LES DONNÉES (Fix 4 : get_all_values) ---
 @st.cache_data(show_spinner="Chargement des données…")
 def load_all_data():
-    """Lit ABSOLUMENT TOUTES les lignes du Google Sheet via get_all_records().
-    Stratégie : on prend les enregistrements bruts, on aligne les colonnes,
-    puis on garde toute ligne ayant AU MOINS un nom OU un montant.
-    Mis en cache : ne ré-interroge le Sheet qu'après une invalidation
-    (bouton 'Actualiser' ou écriture : enregistrement / suppression / édition)."""
+    """Fix 4 - Synchronisation Intégrale :
+    Lit ABSOLUMENT TOUTES les lignes du Google Sheet via worksheet.get_all_values().
+    Cette méthode est plus fiable que get_all_records() car elle ignore les en-têtes
+    dupliqués / manquants et capture vraiment chaque ligne du fichier."""
     sheet = get_sheet()
     if sheet is None:
         return pd.DataFrame(columns=COLS + ["annee"])
 
-    df = None
-
-    # 1) Tentative principale : get_all_records(head=1) — full scan, en-tête en ligne 1
     try:
-        records = sheet.get_all_records(head=1, default_blank="")
-        if records:
-            df = pd.DataFrame(records)
-            # Normalise les noms de colonnes (insensible à la casse / espaces)
-            df.columns = [str(c).strip().lower() for c in df.columns]
-            for c in COLS:
-                if c not in df.columns:
-                    df[c] = ""
-            df = df[COLS]
-    except Exception:
-        df = None  # on tombera sur le fallback
+        # Fix 4 : LECTURE INTÉGRALE via get_all_values()
+        data = sheet.get_all_values()
+    except Exception as e:
+        st.error(f"Erreur lecture Sheet : {e}")
+        return pd.DataFrame(columns=COLS + ["annee"])
 
-    # 2) Fallback : lecture brute en cas d'en-têtes manquants/dupliqués
-    if df is None:
-        try:
-            data = sheet.get_all_values()
-        except Exception as e:
-            st.error(f"Erreur lecture Sheet : {e}")
-            return pd.DataFrame(columns=COLS + ["annee"])
-        if not data or len(data) <= 1:
-            return pd.DataFrame(columns=COLS + ["annee"])
+    if not data or len(data) <= 1:
+        return pd.DataFrame(columns=COLS + ["annee"])
+
+    # Détecte si la première ligne est un en-tête (contient des libellés textuels)
+    header_raw = [str(c).strip().lower() for c in data[0]]
+    expected_headers = {h.lower() for h in COLS}
+    has_header = any(h in expected_headers for h in header_raw)
+
+    body = data[1:] if has_header else data
+
+    # On essaie d'abord de mapper par nom de colonne (insensible à la casse / espaces)
+    if has_header:
+        # Pour chaque ligne, on extrait les colonnes selon l'index trouvé dans l'en-tête
+        col_index_map = {}
+        for col_name in COLS:
+            for i, h in enumerate(header_raw):
+                if h == col_name:
+                    col_index_map[col_name] = i
+                    break
+
         rows = []
-        for r in data[1:]:
+        for r in body:
+            r = list(r)
+            row_dict = {}
+            for col_name in COLS:
+                if col_name in col_index_map:
+                    idx = col_index_map[col_name]
+                    row_dict[col_name] = r[idx] if idx < len(r) else ""
+                else:
+                    row_dict[col_name] = ""
+            rows.append([row_dict[c] for c in COLS])
+    else:
+        # Fallback : on suppose l'ordre standard des colonnes
+        rows = []
+        for r in body:
             r = list(r) + [""] * (len(COLS) - len(r))
             rows.append(r[: len(COLS)])
-        df = pd.DataFrame(rows, columns=COLS)
+
+    df = pd.DataFrame(rows, columns=COLS)
 
     if df is None or df.empty:
         return pd.DataFrame(columns=COLS + ["annee"])
@@ -280,16 +349,6 @@ def load_all_data():
     df = _normalize_df(df)
     df = _apply_strict_filter(df)
     return df
-
-
-def _apply_strict_filter(df):
-    """Filtre minimal : garde toute ligne ayant AU MOINS un nom OU un montant.
-    Supprime uniquement les lignes totalement vides (fantômes du Sheet)."""
-    if df is None or df.empty:
-        return df
-    nom_ok = df["nom"].astype(str).str.strip().ne("")
-    montant_ok = (df["entree"].fillna(0) > 0) | (df["sortie"].fillna(0) > 0)
-    return df[nom_ok | montant_ok].reset_index(drop=True)
 
 
 def load_data(mois_selectionne):
@@ -300,8 +359,7 @@ def load_data(mois_selectionne):
 # --- INVALIDATION DU CACHE ---
 def _invalidate_cache():
     """Vide TOUT le cache des données pour forcer un rechargement frais
-    depuis le Google Sheet au prochain appel de load_all_data().
-    Appelle aussi st.cache_data.clear() pour purger d'éventuels caches résiduels."""
+    depuis le Google Sheet au prochain appel de load_all_data()."""
     try:
         load_all_data.clear()
     except Exception:
@@ -312,11 +370,10 @@ def _invalidate_cache():
         pass
 
 
-# --- ENREGISTREMENT D'UNE NOUVELLE OPÉRATION ---
+# --- ENREGISTREMENT D'UNE NOUVELLE OPÉRATION (Fix 1) ---
 def save_entry(mois, d, nom, classe, designation, entree, sortie):
-    """Ajoute simplement une nouvelle ligne à la fin du Google Sheet
-    et invalide le cache pour que la donnée soit visible immédiatement.
-    Retourne True si l'écriture a réussi."""
+    """Fix 1 : ajoute une nouvelle ligne à la fin du Google Sheet
+    et invalide le cache pour que la donnée soit visible immédiatement."""
     sheet = get_sheet()
     if sheet is None:
         st.error("Connexion au Google Sheet indisponible.")
@@ -341,8 +398,10 @@ def save_entry(mois, d, nom, classe, designation, entree, sortie):
         return False
 
 
-# --- SUPPRESSION PAR ID UNIQUE ---
+# --- SUPPRESSION PAR ID UNIQUE (Fix 5) ---
 def delete_item(item_id):
+    """Fix 5 : suppression d'une ligne par son ID unique.
+    Fonctionne dans tous les onglets (mois courant ET archives)."""
     sheet = get_sheet()
     if sheet is None:
         return False
@@ -353,6 +412,8 @@ def delete_item(item_id):
         return False
 
     target = str(item_id).strip()
+    if not target:
+        return False
     for i, row in enumerate(data):
         if i == 0:
             continue
@@ -365,8 +426,7 @@ def delete_item(item_id):
 
 # --- MODIFICATION PAR ID UNIQUE ---
 def update_item(item_id, updates):
-    """Met à jour les champs d'une ligne identifiée par son id (1ère colonne).
-    `updates` est un dict {nom_colonne: valeur}."""
+    """Met à jour les champs d'une ligne identifiée par son id (1ère colonne)."""
     sheet = get_sheet()
     if sheet is None:
         return False
@@ -402,9 +462,7 @@ def update_item(item_id, updates):
 
 # --- NETTOYAGE DES LIGNES VIDES OU TESTS ---
 def cleanup_empty_rows():
-    """Supprime les lignes considérées comme vides ou tests :
-       - aucun nom ET aucune désignation ET montants à 0
-    Retourne le nombre de lignes supprimées."""
+    """Supprime les lignes vraiment vides : aucun nom, aucune désignation, montants à 0."""
     sheet = get_sheet()
     if sheet is None:
         return 0
@@ -427,9 +485,8 @@ def cleanup_empty_rows():
         ent = _to_number(row[6] if len(row) > 6 else 0)
         sor = _to_number(row[7] if len(row) > 7 else 0)
         if not nom and not des and ent == 0 and sor == 0:
-            indices_to_delete.append(i + 1)  # +1 car gspread est 1-indexé
+            indices_to_delete.append(i + 1)
 
-    # Supprime de la fin vers le début pour garder les indices valides
     deleted = 0
     for sheet_row in sorted(indices_to_delete, reverse=True):
         try:
@@ -444,10 +501,7 @@ def cleanup_empty_rows():
 
 # --- SUPPRESSION DE TOUTE UNE ANNÉE ---
 def delete_year(annee):
-    """Supprime toutes les lignes du Google Sheet appartenant à l'année donnée.
-    L'année est déterminée par la date de chaque ligne ; les lignes sans date
-    valide sont rattachées à l'année courante (cohérent avec _normalize_df).
-    Retourne le nombre de lignes supprimées."""
+    """Supprime toutes les lignes du Google Sheet appartenant à l'année donnée."""
     sheet = get_sheet()
     if sheet is None:
         return 0
@@ -460,7 +514,6 @@ def delete_year(annee):
     if not data or len(data) <= 1:
         return 0
 
-    current_year = date.today().year
     indices_to_delete = []
     for i, row in enumerate(data):
         if i == 0:
@@ -468,10 +521,13 @@ def delete_year(annee):
         row = list(row) + [""] * (len(COLS) - len(row))
         date_str = str(row[2]).strip() if len(row) > 2 else ""
         try:
-            parsed = pd.to_datetime(date_str, errors="coerce")
-            y = int(parsed.year) if pd.notna(parsed) else current_year
+            parsed = pd.to_datetime(date_str, errors="coerce", dayfirst=True)
+            if pd.isna(parsed):
+                parsed = pd.to_datetime(date_str, errors="coerce")
+            # Fix 3 : si date manquante, l'année par défaut est 2022
+            y = int(parsed.year) if pd.notna(parsed) else DEFAULT_DATE_YEAR
         except Exception:
-            y = current_year
+            y = DEFAULT_DATE_YEAR
         if y == int(annee):
             indices_to_delete.append(i + 1)
 
@@ -489,11 +545,7 @@ def delete_year(annee):
 
 # --- NETTOYAGE FORCÉ DES LIGNES INCOMPLÈTES ---
 def cleanup_incomplete_rows():
-    """Nettoyage forcé : supprime toutes les lignes incomplètes
-       - aucun nom, OU
-       - aucun montant (entree=0 ET sortie=0), OU
-       - ligne complètement vide
-    Retourne le nombre de lignes supprimées."""
+    """Nettoyage forcé : supprime les lignes incomplètes (pas de nom OU pas de montant)."""
     sheet = get_sheet()
     if sheet is None:
         return 0
@@ -515,7 +567,6 @@ def cleanup_incomplete_rows():
         des = str(row[3]).strip() if len(row) > 3 else ""
         ent = _to_number(row[6] if len(row) > 6 else 0)
         sor = _to_number(row[7] if len(row) > 7 else 0)
-        # Incomplet si : pas de nom OU pas de montant OU ligne vide
         is_empty = not nom and not des and ent == 0 and sor == 0
         no_name = not nom
         no_amount = ent == 0 and sor == 0
@@ -583,12 +634,12 @@ def build_receipt_pdf(row):
         pdf.set_font("Arial", "", 12)
         pdf.cell(0, line_h, _safe(value), ln=True)
 
-    details("Recu N° :", row["id"])
+    details("Recu N :", row.get("id", ""))
     details("Date :", row.get("date_affichage", row.get("date", "")) or "Date non spécifiée")
     details("Mois :", row.get("mois", ""))
-    details("Eleve :", row["nom"])
-    details("Classe :", row["classe"])
-    details("Motif :", row["designation"])
+    details("Eleve :", row.get("nom", ""))
+    details("Classe :", row.get("classe", ""))
+    details("Motif :", row.get("designation", ""))
 
     pdf.ln(3)
     y = pdf.get_y()
@@ -597,7 +648,9 @@ def build_receipt_pdf(row):
     pdf.set_draw_color(0, 0, 0)
     pdf.ln(6)
 
-    montant = row["entree"] if float(row["entree"]) > 0 else float(row["sortie"])
+    entree_val = float(row.get("entree", 0) or 0)
+    sortie_val = float(row.get("sortie", 0) or 0)
+    montant = entree_val if entree_val > 0 else sortie_val
     pdf.set_font("Arial", "B", 20)
     pdf.cell(0, 14, _safe(f"MONTANT : {montant:,.0f} FCFA".replace(",", " ")), ln=True, align="C")
     pdf.ln(4)
@@ -659,14 +712,16 @@ def build_annual_report_pdf(df_year, mois, annee):
     total_s = 0.0
     for _, r in df_year.iterrows():
         pdf.cell(25, 7, _safe(r.get("date_affichage", r.get("date", "")) or "Date non spécifiée"), border=1)
-        pdf.cell(45, 7, _safe(r["nom"])[:25], border=1)
-        pdf.cell(22, 7, _safe(r["classe"])[:12], border=1)
-        pdf.cell(50, 7, _safe(r["designation"])[:30], border=1)
-        pdf.cell(22, 7, _safe(f"{float(r['entree']):,.0f}".replace(",", " ")), border=1, align="R")
-        pdf.cell(22, 7, _safe(f"{float(r['sortie']):,.0f}".replace(",", " ")), border=1, align="R")
+        pdf.cell(45, 7, _safe(r.get("nom", ""))[:25], border=1)
+        pdf.cell(22, 7, _safe(r.get("classe", ""))[:12], border=1)
+        pdf.cell(50, 7, _safe(r.get("designation", ""))[:30], border=1)
+        ent = float(r.get("entree", 0) or 0)
+        sor = float(r.get("sortie", 0) or 0)
+        pdf.cell(22, 7, _safe(f"{ent:,.0f}".replace(",", " ")), border=1, align="R")
+        pdf.cell(22, 7, _safe(f"{sor:,.0f}".replace(",", " ")), border=1, align="R")
         pdf.ln()
-        total_e += float(r["entree"])
-        total_s += float(r["sortie"])
+        total_e += ent
+        total_s += sor
 
     pdf.set_font("Arial", "B", 10)
     pdf.set_fill_color(245, 245, 245)
@@ -692,8 +747,13 @@ def build_annual_report_pdf(df_year, mois, annee):
     return bytes(output)
 
 
+def fmt_fcfa(n):
+    return f"{float(n):,.0f} FCFA".replace(",", " ")
+
+
 def render_rows_with_actions(df, mois, key_prefix):
-    """Affiche chaque ligne avec ses propres boutons : Modifier / Supprimer / Reçu PDF.
+    """Fix 5 : Affiche chaque ligne avec ses propres boutons : Modifier / Supprimer / Reçu PDF.
+    Fonctionne dans TOUS les onglets (mois en cours et archives).
     Toute suppression cible la vraie ligne du Google Sheet via son ID."""
     if df is None or df.empty:
         return
@@ -723,18 +783,20 @@ def render_rows_with_actions(df, mois, key_prefix):
         edit_key = f"row_edit_open_{uniq}"
         pdf_key = f"row_pdf_{uniq}"
 
-        if a1.button("✏️", key=f"row_editbtn_{uniq}", help="Modifier"):
+        if a1.button("Modifier", key=f"row_editbtn_{uniq}", help="Modifier cette opération"):
             st.session_state[edit_key] = True
 
-        if a2.button("🗑️", key=f"row_delbtn_{uniq}", help="Supprimer définitivement du Google Sheet"):
-            if delete_item(rid):
+        if a2.button("Supprimer", key=f"row_delbtn_{uniq}", help="Supprimer définitivement du Google Sheet"):
+            if not rid:
+                st.error("Cette ligne n'a pas d'ID — suppression impossible.")
+            elif delete_item(rid):
                 st.success(f"Ligne « {row.get('nom','')} » supprimée du Sheet.")
                 time.sleep(0.6)
                 st.rerun()
             else:
                 st.error("Suppression impossible (ID introuvable dans le Sheet).")
 
-        if a3.button("📄", key=f"row_pdfbtn_{uniq}", help="Préparer le reçu PDF"):
+        if a3.button("Reçu PDF", key=f"row_pdfbtn_{uniq}", help="Préparer le reçu PDF"):
             st.session_state[pdf_key] = (
                 build_receipt_pdf(row),
                 f"recu_{rid or idx}_{row.get('nom','')}.pdf",
@@ -743,7 +805,7 @@ def render_rows_with_actions(df, mois, key_prefix):
         if pdf_key in st.session_state:
             pb, pf = st.session_state[pdf_key]
             st.download_button(
-                f"⬇️ Télécharger le reçu de {row.get('nom','')}",
+                f"Télécharger le reçu de {row.get('nom','')}",
                 data=pb,
                 file_name=pf,
                 mime="application/pdf",
@@ -755,7 +817,7 @@ def render_rows_with_actions(df, mois, key_prefix):
             with st.form(f"row_edit_form_{uniq}"):
                 st.markdown(f"**Modifier la ligne de {row.get('nom','')}**")
                 try:
-                    d_default = pd.to_datetime(row["date"]).date()
+                    d_default = pd.to_datetime(row["date"], dayfirst=True).date()
                 except Exception:
                     d_default = date.today()
                 e_d = st.date_input("Date", value=d_default, key=f"re_d_{uniq}")
@@ -764,19 +826,19 @@ def render_rows_with_actions(df, mois, key_prefix):
                     index=MONTHS.index(row["mois"]) if row["mois"] in MONTHS else MONTHS.index(mois),
                     key=f"re_m_{uniq}",
                 )
-                e_nom = st.text_input("Nom", value=row["nom"], key=f"re_n_{uniq}")
-                e_cl = st.text_input("Classe", value=row["classe"], key=f"re_c_{uniq}")
-                e_des = st.text_input("Désignation", value=row["designation"], key=f"re_des_{uniq}")
+                e_nom = st.text_input("Nom", value=row.get("nom", ""), key=f"re_n_{uniq}")
+                e_cl = st.text_input("Classe", value=row.get("classe", ""), key=f"re_c_{uniq}")
+                e_des = st.text_input("Désignation", value=row.get("designation", ""), key=f"re_des_{uniq}")
                 e_ent = st.number_input(
                     "Entrée (FCFA)", min_value=0.0, step=500.0,
-                    value=float(row["entree"] or 0), key=f"re_ent_{uniq}",
+                    value=float(row.get("entree", 0) or 0), key=f"re_ent_{uniq}",
                 )
                 e_sor = st.number_input(
                     "Sortie (FCFA)", min_value=0.0, step=500.0,
-                    value=float(row["sortie"] or 0), key=f"re_sor_{uniq}",
+                    value=float(row.get("sortie", 0) or 0), key=f"re_sor_{uniq}",
                 )
                 cs, cc = st.columns(2)
-                save = cs.form_submit_button("💾 Enregistrer", type="primary")
+                save = cs.form_submit_button("Enregistrer", type="primary")
                 cancel = cc.form_submit_button("Annuler")
                 if save:
                     ok = update_item(rid, {
@@ -802,10 +864,6 @@ def render_rows_with_actions(df, mois, key_prefix):
         st.markdown("<hr style='margin:4px 0;border:0;border-top:1px solid #eee'>", unsafe_allow_html=True)
 
 
-def fmt_fcfa(n):
-    return f"{float(n):,.0f} FCFA".replace(",", " ")
-
-
 # --- INTERFACE ---
 def login_screen():
     col_logo, col_title = st.columns([1, 4])
@@ -822,6 +880,8 @@ def login_screen():
         try:
             expected = st.secrets.get("MON_MOT_DE_PASSE")
         except Exception:
+            expected = None
+        if not expected:
             expected = os.environ.get("MON_MOT_DE_PASSE")
         if pwd and expected and pwd == expected:
             st.session_state.auth = True
@@ -857,6 +917,45 @@ def render_global_dashboard(df_full, annee=None):
     st.divider()
 
 
+def render_new_entry_form(default_mois):
+    """Fix 1 : Formulaire d'enregistrement d'une nouvelle opération.
+    Affiché en haut de la page dans un st.expander."""
+    with st.expander("Ajouter une opération", expanded=False):
+        with st.form("form_new_entry", clear_on_submit=True):
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                f_date = st.date_input("Date", value=date.today(), key="ne_date")
+                f_mois = st.selectbox(
+                    "Mois",
+                    MONTHS,
+                    index=MONTHS.index(default_mois) if default_mois in MONTHS else 0,
+                    key="ne_mois",
+                )
+                f_nom = st.text_input("Nom de l'élève", key="ne_nom")
+                f_classe = st.text_input("Classe", key="ne_classe")
+            with fc2:
+                f_des = st.text_input("Désignation", key="ne_des")
+                f_entree = st.number_input(
+                    "Entrée (FCFA)", min_value=0.0, step=500.0, key="ne_entree"
+                )
+                f_sortie = st.number_input(
+                    "Sortie (FCFA)", min_value=0.0, step=500.0, key="ne_sortie"
+                )
+            submitted = st.form_submit_button("Enregistrer", type="primary")
+            if submitted:
+                if not f_nom.strip() and f_entree == 0 and f_sortie == 0:
+                    st.warning("Veuillez renseigner au moins un nom ou un montant.")
+                elif save_entry(
+                    f_mois, f_date, f_nom, f_classe, f_des, f_entree, f_sortie
+                ):
+                    st.success(
+                        f"Opération enregistrée pour {f_mois} {f_date.year}. "
+                        "L'application va se rafraîchir."
+                    )
+                    time.sleep(0.6)
+                    st.rerun()
+
+
 def main():
     if "auth" not in st.session_state:
         st.session_state.auth = False
@@ -879,17 +978,27 @@ def main():
     current_year = date.today().year
 
     # ============================================================
-    # TABLEAU DE BORD GLOBAL (toutes années confondues) — TOUJOURS VISIBLE
+    # FORMULAIRE D'ENREGISTREMENT (Fix 1) — TOUJOURS VISIBLE EN HAUT
+    # ============================================================
+    today_m = date.today().month
+    default_mois = next(
+        (m for m in MONTHS if MONTH_INDEX.get(m) == today_m),
+        MONTHS[0],
+    )
+    render_new_entry_form(default_mois)
+
+    # ============================================================
+    # TABLEAU DE BORD GLOBAL (toutes années confondues)
     # ============================================================
     render_global_dashboard(df_full)
+    annees_count = len({int(y) for y in df_full["annee"].unique() if int(y) > 0}) if not df_full.empty else 0
     st.caption(
-        f"📊 **Lecture intégrale du Google Sheet** : "
-        f"{len(df_full)} opération(s) chargée(s) "
-        f"sur {len(set(int(y) for y in df_full['annee'].unique() if int(y) > 0))} année(s)."
+        f"**Lecture intégrale du Google Sheet** : "
+        f"{len(df_full)} opération(s) chargée(s) sur {annees_count} année(s)."
     )
 
     # ============================================================
-    # 1) SÉLECTEUR D'ANNÉE — par défaut RIEN n'est affiché en détail
+    # SÉLECTEUR D'ANNÉE
     # ============================================================
     available_years = sorted(
         {int(y) for y in df_full["annee"].unique() if int(y) > 0},
@@ -901,7 +1010,7 @@ def main():
     sel_col1, sel_col2 = st.columns([3, 1])
     with sel_col1:
         sel_year = st.selectbox(
-            "📅 Choisir une année à afficher",
+            "Choisir une année à afficher",
             options=available_years,
             index=None,
             placeholder="-- Sélectionnez une année --",
@@ -910,7 +1019,7 @@ def main():
     with sel_col2:
         st.write("")
         st.write("")
-        if st.button("🔄 Actualiser", type="secondary", help="Recharger depuis le Google Sheet"):
+        if st.button("Actualiser", type="secondary", help="Recharger depuis le Google Sheet"):
             _invalidate_cache()
             for k in list(st.session_state.keys()):
                 if (
@@ -919,20 +1028,21 @@ def main():
                     or k.startswith("arc_pdf")
                     or k.startswith("rep_bytes_")
                     or k.startswith("cur_rep_bytes_")
+                    or k.startswith("month_rep_bytes_")
+                    or k.startswith("year_rep_bytes_")
                 ):
                     del st.session_state[k]
-            st.toast("Données rechargées depuis le Google Sheet.", icon="🔄")
+            st.toast("Données rechargées depuis le Google Sheet.")
             st.rerun()
 
     if sel_year is None:
         st.info(
-            "👆 Sélectionnez une année dans le menu ci-dessus pour afficher les opérations.\n\n"
-            "Aucune donnée n'est chargée tant qu'une année n'est pas choisie."
+            "Sélectionnez une année dans le menu ci-dessus pour afficher les opérations."
         )
         return
 
     # ============================================================
-    # 2) DONNÉES FILTRÉES SUR L'ANNÉE SÉLECTIONNÉE
+    # DONNÉES FILTRÉES SUR L'ANNÉE SÉLECTIONNÉE
     # ============================================================
     df_year = df_full[df_full["annee"] == sel_year].reset_index(drop=True)
 
@@ -945,7 +1055,7 @@ def main():
     with act_c1:
         year_rep_key = f"year_rep_bytes_{sel_year}"
         if st.button(
-            f"📊 Imprimer toute l'année {sel_year}",
+            f"Imprimer toute l'année {sel_year}",
             key=f"year_rep_btn_{sel_year}",
             use_container_width=True,
         ):
@@ -956,7 +1066,7 @@ def main():
         if year_rep_key in st.session_state:
             yrb, yrf = st.session_state[year_rep_key]
             st.download_button(
-                "⬇️ Télécharger le rapport annuel",
+                "Télécharger le rapport annuel",
                 data=yrb,
                 file_name=yrf,
                 mime="application/pdf",
@@ -965,7 +1075,7 @@ def main():
             )
 
     with act_c2:
-        with st.expander(f"🗑️ Supprimer toute l'année {sel_year}"):
+        with st.expander(f"Supprimer toute l'année {sel_year}"):
             st.warning(
                 f"Cette action supprime **toutes les opérations de {sel_year}** "
                 "(tous mois confondus) du Google Sheet. Action irréversible."
@@ -989,10 +1099,10 @@ def main():
                 else:
                     st.info(f"Aucune ligne {sel_year} trouvée.")
 
-    # --- Outils d'administration (repliés par défaut) ---
-    with st.expander("⚙️ Outils d'administration"):
+    # --- Outils d'administration ---
+    with st.expander("Outils d'administration"):
         st.write("Nettoyage des lignes vides ou test (sans nom, sans désignation, montants à 0).")
-        if st.button("🧹 Nettoyer les lignes vides", key="clean_empty_btn"):
+        if st.button("Nettoyer les lignes vides", key="clean_empty_btn"):
             n = cleanup_empty_rows()
             if n > 0:
                 st.success(f"{n} ligne(s) supprimée(s).")
@@ -1008,7 +1118,7 @@ def main():
             key="force_cleanup_confirm",
         )
         if st.button(
-            "🔥 Nettoyage forcé",
+            "Nettoyage forcé",
             type="primary",
             disabled=not force_confirm,
             key="force_clean_btn",
@@ -1022,60 +1132,7 @@ def main():
             st.rerun()
 
     # ============================================================
-    # 3) FORMULAIRE D'ENREGISTREMENT — EN HAUT, TOUJOURS VISIBLE
-    # ============================================================
-    is_current_year = (sel_year == current_year)
-
-    # Détermine le mois actuel (en français) pour pré-sélectionner dans le formulaire
-    today_m = date.today().month
-    default_mois = next(
-        (m for m in MONTHS if MONTH_INDEX.get(m) == today_m),
-        MONTHS[0],
-    )
-
-    if is_current_year:
-        with st.expander("➕ Nouvelle opération", expanded=False):
-            with st.form("form_new_entry", clear_on_submit=True):
-                fc1, fc2 = st.columns(2)
-                with fc1:
-                    f_date = st.date_input("Date", value=date.today(), key="ne_date")
-                    f_mois = st.selectbox(
-                        "Mois",
-                        MONTHS,
-                        index=MONTHS.index(default_mois),
-                        key="ne_mois",
-                    )
-                    f_nom = st.text_input("Nom de l'élève", key="ne_nom")
-                    f_classe = st.text_input("Classe", key="ne_classe")
-                with fc2:
-                    f_des = st.text_input("Désignation", key="ne_des")
-                    f_entree = st.number_input(
-                        "Entrée (FCFA)", min_value=0.0, step=500.0, key="ne_entree"
-                    )
-                    f_sortie = st.number_input(
-                        "Sortie (FCFA)", min_value=0.0, step=500.0, key="ne_sortie"
-                    )
-                submitted = st.form_submit_button("💾 Enregistrer", type="primary")
-                if submitted:
-                    if not f_nom.strip() and f_entree == 0 and f_sortie == 0:
-                        st.warning("Veuillez renseigner au moins un nom ou un montant.")
-                    elif save_entry(
-                        f_mois, f_date, f_nom, f_classe, f_des, f_entree, f_sortie
-                    ):
-                        st.success(
-                            f"✅ Opération enregistrée pour {f_mois} {f_date.year}. "
-                            "Ouvrez l'onglet correspondant pour la voir."
-                        )
-                        time.sleep(0.6)
-                        st.rerun()
-    else:
-        st.caption(
-            f"📁 Année archivée ({sel_year}) — l'ajout de nouvelles opérations "
-            f"n'est possible que pour l'année en cours ({current_year})."
-        )
-
-    # ============================================================
-    # 4) ONGLETS MENSUELS (Septembre → Août) FILTRÉS SUR L'ANNÉE
+    # ONGLETS MENSUELS (Septembre -> Août) FILTRÉS SUR L'ANNÉE
     # ============================================================
     tabs = st.tabs(MONTHS)
     for i, mois in enumerate(MONTHS):
@@ -1090,7 +1147,8 @@ def main():
             c2.metric("Sorties", fmt_fcfa(t_s))
             c3.metric("Solde", fmt_fcfa(t_e - t_s))
 
-            # Tableau des opérations + boutons par ligne (Modifier / Supprimer / Reçu PDF)
+            # Fix 5 : Tableau des opérations + boutons par ligne
+            # Fonctionne pour TOUS les mois et TOUTES les années (courante et archives)
             if df.empty:
                 st.info(f"Aucune opération pour {mois} {sel_year}.")
             else:
@@ -1099,10 +1157,10 @@ def main():
                     key_prefix=f"m_{mois}_{sel_year}",
                 )
 
-                # Bouton "Imprimer le mois"
+                # Fix 5 : Bouton "Imprimer le mois" (fonctionne partout)
                 month_rep_key = f"month_rep_bytes_{mois}_{sel_year}"
                 if st.button(
-                    f"📊 Imprimer le mois ({mois} {sel_year})",
+                    f"Imprimer le mois ({mois} {sel_year})",
                     key=f"month_rep_btn_{mois}_{sel_year}",
                 ):
                     st.session_state[month_rep_key] = (
@@ -1112,13 +1170,12 @@ def main():
                 if month_rep_key in st.session_state:
                     mrb, mrf = st.session_state[month_rep_key]
                     st.download_button(
-                        "⬇️ Télécharger le rapport du mois",
+                        "Télécharger le rapport du mois",
                         data=mrb,
                         file_name=mrf,
                         mime="application/pdf",
                         key=f"month_dlrep_{mois}_{sel_year}",
                     )
-
 
 
 if __name__ == "__main__":
