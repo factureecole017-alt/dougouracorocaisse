@@ -237,9 +237,11 @@ def _intelligent_date_repair(df):
 
     repaired = parsed.where(is_valid)
     nb_repaired = 0
+    aberrant_records = []   # pour le panneau Diagnostic
 
     parsed_list = parsed.tolist()
     valid_list = is_valid.tolist()
+    raw_list = raw_dates.tolist()
     n = len(parsed_list)
 
     for pos in range(n):
@@ -274,7 +276,13 @@ def _intelligent_date_repair(df):
         repaired.iloc[pos] = chosen
         nb_repaired += 1
 
-    return repaired, nb_repaired
+        aberrant_records.append({
+            "pos": pos,
+            "date_originale": raw_list[pos] if raw_list[pos] else "(vide)",
+            "date_corrigee": chosen.strftime("%d/%m/%Y"),
+        })
+
+    return repaired, nb_repaired, aberrant_records
 
 
 def _normalize_df(df):
@@ -295,8 +303,9 @@ def _normalize_df(df):
         df[col] = df[col].astype(str).fillna("").str.strip()
 
     # Fix 1 + Fix 5 : Correction intelligente des dates aberrantes / manquantes
-    repaired, nb_repaired = _intelligent_date_repair(df)
+    repaired, nb_repaired, aberrant_records = _intelligent_date_repair(df)
     df.attrs["nb_dates_repaired"] = int(nb_repaired)
+    df.attrs["aberrant_records"] = aberrant_records   # pour Diagnostic
 
     df["date_triable"] = repaired
     df["annee"] = repaired.dt.year.astype(int)
@@ -373,13 +382,16 @@ def _apply_strict_filter(df):
     )
     dup_mask = dedup_key.duplicated(keep="first")
     nb_duplicates = int(dup_mask.sum())
+    # Garde les lignes en double pour le panneau Diagnostic (avec colonne clé)
+    df_duplicates = df.loc[dup_mask].copy() if nb_duplicates > 0 else pd.DataFrame()
     df = df.loc[~dup_mask].reset_index(drop=True)
 
-    # Diagnostic exposé via df.attrs (consulté par le tableau de bord)
+    # Diagnostic exposé via df.attrs (consulté par le tableau de bord et Diagnostic)
     df.attrs["nb_raw_rows"] = nb_raw
     df.attrs["nb_summary_rows"] = nb_summary
     df.attrs["nb_empty_rows"] = nb_empty
     df.attrs["nb_duplicates"] = nb_duplicates
+    df.attrs["duplicate_rows"] = df_duplicates   # pour Diagnostic
 
     return df
 
@@ -447,7 +459,27 @@ def load_all_data():
 
     nb_sheet_rows = len(df)
     df = _normalize_df(df)
+    # Sauvegarde des attrs avant _apply_strict_filter (qui reset_index les perd)
     nb_dates_repaired = int(df.attrs.get("nb_dates_repaired", 0))
+    aberrant_records = df.attrs.get("aberrant_records", [])
+    # Ajoute les colonnes nom/classe/designation aux enregistrements aberrants
+    for rec in aberrant_records:
+        pos = rec["pos"]
+        if pos < len(df):
+            rec["nom"] = str(df.iloc[pos].get("nom", ""))
+            rec["classe"] = str(df.iloc[pos].get("classe", ""))
+            rec["designation"] = str(df.iloc[pos].get("designation", ""))
+            rec["entree"] = float(df.iloc[pos].get("entree", 0) or 0)
+            rec["sortie"] = float(df.iloc[pos].get("sortie", 0) or 0)
+            rec["id"] = str(df.iloc[pos].get("id", ""))
+        else:
+            rec.setdefault("nom", "")
+            rec.setdefault("classe", "")
+            rec.setdefault("designation", "")
+            rec.setdefault("entree", 0.0)
+            rec.setdefault("sortie", 0.0)
+            rec.setdefault("id", "")
+
     df = _apply_strict_filter(df)
 
     # Tri chronologique inversé : le plus récent en premier (Fix 3)
@@ -456,9 +488,10 @@ def load_all_data():
             "date_triable", ascending=False, kind="mergesort"
         ).reset_index(drop=True)
 
-    # Diagnostic global (consulté par le tableau de bord)
+    # Diagnostic global (consulté par le tableau de bord et le panneau Diagnostic)
     df.attrs["nb_sheet_rows"] = nb_sheet_rows
     df.attrs["nb_dates_repaired"] = nb_dates_repaired
+    df.attrs["aberrant_records"] = aberrant_records
     return df
 
 
@@ -1011,6 +1044,175 @@ def login_screen():
             st.error("Mot de passe incorrect.")
 
 
+def render_diagnostic_panel(df_full):
+    """Panneau Diagnostic — 4 sections :
+      1. Nombre de lignes par mois (tous mois/années)
+      2. Montants suspects (> 1 000 000 FCFA)
+      3. Doublons identifiés (proposés à la suppression)
+      4. Erreurs de dates à corriger (dates aberrantes avant 2020)
+    """
+    with st.expander("Diagnostic des données", expanded=False):
+
+        # ── 1. LIGNES PAR MOIS ───────────────────────────────────────────────
+        st.markdown("#### 1. Nombre de lignes par mois")
+        if df_full.empty:
+            st.info("Aucune donnée chargée.")
+        else:
+            # Compte par (annee, mois) dans l'ordre scolaire
+            grp = (
+                df_full.groupby(["annee", "mois"])
+                .agg(
+                    nb=("id", "count"),
+                    entrees=("entree", "sum"),
+                    sorties=("sortie", "sum"),
+                )
+                .reset_index()
+            )
+            # Trie par année puis par ordre scolaire des mois
+            month_order = {m: i for i, m in enumerate(MONTHS)}
+            grp["mois_order"] = grp["mois"].map(lambda m: month_order.get(m, 99))
+            grp = grp.sort_values(["annee", "mois_order"]).drop(
+                columns=["mois_order"]
+            )
+            grp = grp.rename(
+                columns={
+                    "annee": "Année",
+                    "mois": "Mois",
+                    "nb": "Lignes",
+                    "entrees": "Entrées (FCFA)",
+                    "sorties": "Sorties (FCFA)",
+                }
+            )
+            grp["Entrées (FCFA)"] = grp["Entrées (FCFA)"].map(
+                lambda x: f"{x:,.0f}".replace(",", " ")
+            )
+            grp["Sorties (FCFA)"] = grp["Sorties (FCFA)"].map(
+                lambda x: f"{x:,.0f}".replace(",", " ")
+            )
+            st.dataframe(grp, use_container_width=True, hide_index=True)
+            st.caption(
+                f"Total : **{len(df_full)}** lignes valides sur "
+                f"**{df_full.attrs.get('nb_sheet_rows', '?')}** lignes brutes dans le Sheet."
+            )
+
+        st.divider()
+
+        # ── 2. MONTANTS SUSPECTS (> 1 000 000) ──────────────────────────────
+        st.markdown("#### 2. Montants supérieurs à 1 000 000 FCFA")
+        SEUIL = 1_000_000
+        if not df_full.empty:
+            mask_gros = (df_full["entree"] > SEUIL) | (df_full["sortie"] > SEUIL)
+            df_gros = df_full.loc[mask_gros].copy()
+        else:
+            df_gros = pd.DataFrame()
+
+        if df_gros.empty:
+            st.success("Aucun montant supérieur à 1 000 000 FCFA détecté.")
+        else:
+            st.warning(
+                f"{len(df_gros)} ligne(s) avec un montant > 1 000 000 FCFA — "
+                "vérifiez qu'il ne s'agit pas d'une erreur de saisie."
+            )
+            for idx, (_, row) in enumerate(df_gros.iterrows()):
+                rid = str(row.get("id", "") or "").strip()
+                uniq = f"diag_gros_{idx}_{rid}"
+                c = st.columns([1.2, 1.6, 1.0, 2.0, 1.1, 1.1, 1.2])
+                c[0].write(row.get("date_affichage", ""))
+                c[1].write(row.get("nom", ""))
+                c[2].write(row.get("classe", ""))
+                c[3].write(row.get("designation", ""))
+                ent = float(row.get("entree", 0) or 0)
+                sor = float(row.get("sortie", 0) or 0)
+                c[4].write(
+                    f"**{fmt_fcfa(ent)}**" if ent > SEUIL else fmt_fcfa(ent)
+                )
+                c[5].write(
+                    f"**{fmt_fcfa(sor)}**" if sor > SEUIL else fmt_fcfa(sor)
+                )
+                if c[6].button(
+                    "Supprimer", key=f"diag_del_gros_{uniq}",
+                    help="Supprimer cette ligne du Google Sheet"
+                ):
+                    if rid and delete_item(rid):
+                        st.success(f"Ligne « {row.get('nom','')} » supprimée.")
+                        time.sleep(0.5)
+                        st.rerun()
+                    else:
+                        st.error("Suppression impossible.")
+                st.markdown(
+                    "<hr style='margin:3px 0;border:0;border-top:1px solid #eee'>",
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+
+        # ── 3. DOUBLONS ──────────────────────────────────────────────────────
+        st.markdown("#### 3. Doublons identifiés")
+        df_dup = df_full.attrs.get("duplicate_rows", pd.DataFrame())
+        if df_dup is None or (isinstance(df_dup, pd.DataFrame) and df_dup.empty):
+            st.success("Aucun doublon détecté — toutes les lignes sont uniques.")
+        else:
+            st.warning(
+                f"{len(df_dup)} ligne(s) en double détectée(s) et déjà exclue(s) "
+                "des totaux. Vous pouvez les supprimer définitivement du Google Sheet."
+            )
+            for idx, (_, row) in enumerate(df_dup.iterrows()):
+                rid = str(row.get("id", "") or "").strip()
+                uniq = f"diag_dup_{idx}_{rid}"
+                c = st.columns([1.2, 1.6, 1.0, 2.0, 1.1, 1.1, 1.2])
+                c[0].write(row.get("date_affichage", ""))
+                c[1].write(row.get("nom", ""))
+                c[2].write(row.get("classe", ""))
+                c[3].write(row.get("designation", ""))
+                c[4].write(fmt_fcfa(float(row.get("entree", 0) or 0)))
+                c[5].write(fmt_fcfa(float(row.get("sortie", 0) or 0)))
+                if c[6].button(
+                    "Supprimer", key=f"diag_del_dup_{uniq}",
+                    help="Supprimer ce doublon du Google Sheet"
+                ):
+                    if rid and delete_item(rid):
+                        st.success(f"Doublon « {row.get('nom','')} » supprimé.")
+                        time.sleep(0.5)
+                        st.rerun()
+                    else:
+                        st.error("Suppression impossible (ID introuvable).")
+                st.markdown(
+                    "<hr style='margin:3px 0;border:0;border-top:1px solid #eee'>",
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+
+        # ── 4. ERREURS DE DATES ──────────────────────────────────────────────
+        st.markdown("#### 4. Erreurs à corriger — Dates aberrantes")
+        aberrant = df_full.attrs.get("aberrant_records", [])
+        if not aberrant:
+            st.success("Aucune date aberrante détectée — toutes les dates sont valides.")
+        else:
+            st.warning(
+                f"{len(aberrant)} ligne(s) avec une date invalide ou antérieure à 2020. "
+                "La correction automatique a été appliquée — vérifiez la colonne "
+                "« Date corrigée » et corrigez directement dans le Google Sheet si besoin."
+            )
+            diag_cols = st.columns([0.8, 1.2, 1.5, 1.0, 1.8, 1.0, 1.0])
+            for lbl in ["Ligne", "Date originale", "Date corrigée", "Nom", "Désignation", "Entrée", "Sortie"]:
+                diag_cols[["Ligne", "Date originale", "Date corrigée", "Nom", "Désignation", "Entrée", "Sortie"].index(lbl)].markdown(f"**{lbl}**")
+            st.markdown("---")
+            for rec in aberrant:
+                row_c = st.columns([0.8, 1.2, 1.5, 1.0, 1.8, 1.0, 1.0])
+                row_c[0].write(str(rec.get("pos", "") + 2))   # +2 : 1 pour l'en-tête, 1 pour 0-index
+                row_c[1].write(f"**:red[{rec.get('date_originale', '')}]**")
+                row_c[2].write(rec.get("date_corrigee", ""))
+                row_c[3].write(rec.get("nom", ""))
+                row_c[4].write(rec.get("designation", ""))
+                row_c[5].write(fmt_fcfa(rec.get("entree", 0)))
+                row_c[6].write(fmt_fcfa(rec.get("sortie", 0)))
+                st.markdown(
+                    "<hr style='margin:3px 0;border:0;border-top:1px solid #eee'>",
+                    unsafe_allow_html=True,
+                )
+
+
 def render_global_dashboard(df_full, annee=None):
     """Tableau de bord global : cumul des opérations.
     Si `annee` est fourni, n'affiche que les totaux de cette année.
@@ -1184,6 +1386,11 @@ def main():
         f"{annees_count} année(s) couverte(s) · "
         f"objectif Excel : 5934 lignes."
     )
+
+    # ============================================================
+    # PANNEAU DIAGNOSTIC
+    # ============================================================
+    render_diagnostic_panel(df_full)
 
     # ============================================================
     # SÉLECTEUR D'ANNÉE
